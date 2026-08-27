@@ -1,0 +1,16 @@
+# JCasC equivalent of init.groovy.d/pfe-devsecops-library.groovy, kept for
+# reference in case this controller later standardizes on
+# configuration-as-code. Not currently applied (JCasC plugin not installed
+# on this controller as of this migration).
+unclassified:
+  globalLibraries:
+    libraries:
+      - name: "pfe-devsecops"
+        defaultVersion: "main"
+        implicit: false
+        allowVersionOverride: true
+        retriever:
+          modernSCM:
+            scm:
+              git:
+                remote: "https://github.com/souhaiel11/pfe-devsecops-shared-library.git" # update if hosted elsewhere
