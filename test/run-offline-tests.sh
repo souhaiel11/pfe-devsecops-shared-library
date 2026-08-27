@@ -30,4 +30,4 @@ java -cp "$GROOVY_JAR:$OUT" org.codehaus.groovy.tools.FileSystemCompiler -d "$OU
     "$HERE"/FakeSteps.groovy "$HERE"/offline_tests.groovy
 
 echo "== Running executable offline tests =="
-java -cp "$GROOVY_JAR:$OUT" offline_tests
+LIB_ROOT="$LIB_ROOT" java -cp "$GROOVY_JAR:$OUT" offline_tests

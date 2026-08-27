@@ -13,6 +13,11 @@ class FakeSteps {
     Map<String, Integer> statusFor = [:]
     List<String> echoed = []
 
+    /** Optional: given the script text, return an exit status, or null to fall back to statusFor/0. Lets tests key off a substring instead of an exact huge-script match. */
+    Closure<Integer> statusDecider = null
+    /** Optional: given the script text, return stdout, or null to fall back to stdoutFor/''. */
+    Closure<String> stdoutDecider = null
+
     def dir(String path, Closure body) { body.call() }
 
     def catchError(Map args, Closure body) {
@@ -24,8 +29,20 @@ class FakeSteps {
     def sh(Map args) {
         String script = (args.script ?: '').toString()
         shScripts << script
-        if (args.returnStdout) return stdoutFor.get(script, '')
-        if (args.returnStatus) return statusFor.containsKey(script) ? statusFor[script] : 0
+        if (args.returnStdout) {
+            if (stdoutDecider) {
+                def decided = stdoutDecider.call(script)
+                if (decided != null) return decided
+            }
+            return stdoutFor.get(script, '')
+        }
+        if (args.returnStatus) {
+            if (statusDecider) {
+                def decided = statusDecider.call(script)
+                if (decided != null) return decided
+            }
+            return statusFor.containsKey(script) ? statusFor[script] : 0
+        }
         return null
     }
 
