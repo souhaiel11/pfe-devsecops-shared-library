@@ -13,4 +13,5 @@ unclassified:
           modernSCM:
             scm:
               git:
-                remote: "https://github.com/souhaiel11/pfe-devsecops-shared-library.git" # update if hosted elsewhere
+                remote: "https://github.com/souhaiel11/pfe-devsecops-shared-library.git"
+                credentialsId: "github" # same credential already used by pfe-app-test-multibranch (private repo)

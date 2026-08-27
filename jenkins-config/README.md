@@ -13,17 +13,13 @@ This Jenkins instance (`jenkins/jenkins:2.568.1-lts-jdk21`, container name
 `/var/jenkins_home/plugins/pipeline-groovy-lib.jpi` exists) — no plugin
 install is required, only configuration.
 
-## Prerequisite: host this repository somewhere Jenkins can pull it from
+## Hosting (done)
 
-Pick one:
-
-- **GitHub** (recommended, matches how `pfe-app-test` is already hosted):
-  push this repo to a new `souhaiel11/pfe-devsecops-shared-library` GitHub
-  repository, then use its clone URL in `init.groovy.d/pfe-devsecops-library.groovy`.
-- **Local bind mount**: mount this directory read-only into the Jenkins
-  container and reference it as a `file://` git remote, or as a local-branch
-  `LibraryRetriever` (avoids needing network access from Jenkins to GitHub,
-  but is a container/compose change of its own).
+Pushed to `https://github.com/souhaiel11/pfe-devsecops-shared-library`
+(private repo). The init script below authenticates with the `github`
+Jenkins credential -- already configured and in active use by the
+`pfe-app-test-multibranch` job (confirmed in its `config.xml`), so no new
+credential needs to be created.
 
 ## Option A (used here): `init.groovy.d` Groovy init script
 
@@ -36,12 +32,11 @@ runs everything under `init.groovy.d/` once on controller startup.
 To apply:
 
 ```bash
-# 1. Fill in the real git URL at the top of the script below.
-# 2. Copy it into the running controller's init.groovy.d:
+# 1. Copy it into the running controller's init.groovy.d:
 docker cp jenkins-config/init.groovy.d/pfe-devsecops-library.groovy jenkins:/var/jenkins_home/init.groovy.d/
-# 3. Restart the controller so it runs (does NOT trigger any job/build):
+# 2. Restart the controller so it runs (does NOT trigger any job/build):
 docker restart jenkins
-# 4. Verify: Manage Jenkins > System > Global Trusted Pipeline Libraries
+# 3. Verify: Manage Jenkins > System > Global Trusted Pipeline Libraries
 #    should show "pfe-devsecops".
 ```
 
