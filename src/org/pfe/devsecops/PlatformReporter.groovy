@@ -39,7 +39,11 @@ class PlatformReporter implements Serializable {
             tests           : args.tests,
             sonar           : args.sonar,
             docker          : args.docker,
-            kubernetes      : args.kubernetes
+            kubernetes      : args.kubernetes,
+            // Additive (QA-BUILD-135-R1 Defect D): factual ZAP execution diagnostics.
+            // null when the ZAP stage was never entered (PR build / disabled by policy).
+            // Existing consumers reading only reports.available.zap are unaffected.
+            zap             : args.zap
         ]
     }
 

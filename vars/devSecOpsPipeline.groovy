@@ -83,6 +83,7 @@ def call(Closure body = null) {
             String n8nReportBase = "${PlatformConfig.N8N_REPORT_ROOT}/${applicationName}/${env.BUILD_NUMBER}"
 
             boolean checkoutFailed = false
+            boolean zapStageEntered = false
 
             withCredentials([
                 string(credentialsId: PlatformConfig.CRED_SONAR_TOKEN, variable: 'SONAR_TOKEN'),
@@ -104,8 +105,17 @@ def call(Closure body = null) {
 
                 try {
                     stage('Checkout') {
-                        checkout scm
-                        sh 'echo "Commit: $(git rev-parse --short HEAD || echo unknown)"'
+                        def scmVars = checkout(scm)
+                        // Defect C (QA-BUILD-135-R1): env.GIT_COMMIT proved unreliable from
+                        // this scripted-library flow (build #135 sent commit="unknown" despite
+                        // a confirmed-successful checkout). Capture the SHA directly instead of
+                        // trusting env.GIT_COMMIT as the source of truth -- fallback order is
+                        // git rev-parse (this checkout, guaranteed accurate) -> the checkout
+                        // step's own return map -> null (never fabricated).
+                        String capturedSha = sh(script: 'git rev-parse HEAD 2>/dev/null || true', returnStdout: true).trim()
+                        telemetry.checkoutFullSha = capturedSha ?: (scmVars?.GIT_COMMIT ?: null)
+                        telemetry.checkoutShortSha = telemetry.checkoutFullSha ? telemetry.checkoutFullSha.take(8) : null
+                        echo "Commit: ${telemetry.checkoutShortSha ?: 'unknown'}"
                     }
                 } catch (checkoutEx) {
                     checkoutFailed = true
@@ -152,16 +162,21 @@ def call(Closure body = null) {
                         }
                     }
 
-                    if (!isPR) {
+                    if (!isPR && PlatformConfig.ZAP_ENABLED_ON_BRANCH_BUILDS) {
+                        zapStageEntered = true
                         stage('Kubernetes Target Check') {
                             scanners.checkKubernetesTarget(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, applicationServiceName(zapTargetUrl))
                         }
-                        if (PlatformConfig.ZAP_ENABLED_ON_BRANCH_BUILDS) {
-                            stage('ZAP DAST Scan') {
-                                timeout(time: PlatformConfig.TIMEOUT_ZAP_MINUTES, unit: 'MINUTES') {
-                                    scanners.runZap(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, zapTargetUrl, env.BUILD_NUMBER, reportBase)
-                                }
+                        stage('ZAP DAST Scan') {
+                            timeout(time: PlatformConfig.TIMEOUT_ZAP_MINUTES, unit: 'MINUTES') {
+                                scanners.runZap(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, zapTargetUrl, env.BUILD_NUMBER, reportBase)
                             }
+                        }
+                    } else if (!isPR) {
+                        // ZAP_ENABLED_ON_BRANCH_BUILDS=false is mandatory platform policy, not
+                        // a project choice -- still worth a reachability signal for humans.
+                        stage('Kubernetes Target Check') {
+                            scanners.checkKubernetesTarget(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, applicationServiceName(zapTargetUrl))
                         }
                     }
                 }
@@ -172,7 +187,7 @@ def call(Closure body = null) {
                 reportToPlatform(this, telemetry, cleanup, reporter, [
                     applicationName: applicationName, imageName: imageName, imageTag: imageTag,
                     isPR: isPR, reportBase: reportBase, n8nReportBase: n8nReportBase,
-                    checkoutFailed: checkoutFailed, zapTargetUrl: zapTargetUrl
+                    checkoutFailed: checkoutFailed, zapTargetUrl: zapTargetUrl, zapStageEntered: zapStageEntered
                 ])
             }
         }
@@ -210,7 +225,10 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
             }
 
             String branch = env.GIT_BRANCH?.replaceAll('origin/', '') ?: 'main'
-            String commit = env.GIT_COMMIT?.take(8) ?: 'unknown'
+            // Defect C fallback order: captured checkout SHA (git rev-parse, taken at
+            // the moment of checkout -- see Checkout stage) -> env.GIT_COMMIT -> only
+            // 'unknown' if genuinely unresolved. Never fabricated.
+            String commit = telemetry.checkoutShortSha ?: (env.GIT_COMMIT?.take(8)) ?: 'unknown'
 
             Map technicalFailure = null
             if (ctx.checkoutFailed) {
@@ -234,7 +252,12 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                 telemetry.buildStageStatus['tests'] = telemetry.tests.status
                 telemetry.buildStageStatus['trivy'] = trivyAvailable ? 'COMPLETED' : 'UNKNOWN'
                 telemetry.buildStageStatus['owasp'] = owaspAvailable ? 'COMPLETED' : 'UNKNOWN'
-                telemetry.buildStageStatus['zap']   = zapAvailable   ? 'COMPLETED' : 'UNKNOWN'
+                // Defect B: never "COMPLETED" from bare file existence -- a status-stub
+                // report (zap_k8s_unreachable / zap_pod_launch_failed / zap_report_missing)
+                // is a diagnostic artifact, not a successful scan. Canonical vocabulary:
+                // NOT_RUN (deliberately not entered) | FAILED (entered, no usable result) |
+                // COMPLETED (launched and produced a usable report).
+                telemetry.buildStageStatus['zap'] = telemetry.zapStageStatus(ctx.zapStageEntered)
                 telemetry.buildStageStatus['build'] = telemetry.buildStageStatus['build'] ?: 'UNKNOWN'
                 telemetry.buildStageStatus['sonar'] = telemetry.buildStageStatus['sonar'] ?: 'UNKNOWN'
                 telemetry.buildStageStatus['docker'] = telemetry.docker.build_status
@@ -290,7 +313,13 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                     image_tag   : telemetry.docker.image_tag,
                     push_status : telemetry.docker.push_status
                 ],
-                kubernetes: [namespace: PlatformConfig.K8S_NAMESPACE, target: ctx.zapTargetUrl]
+                kubernetes: [namespace: PlatformConfig.K8S_NAMESPACE, target: ctx.zapTargetUrl],
+                // Defect D: factual ZAP execution diagnostics, additive alongside the
+                // existing reports.available.zap flag WF1 already consumes. Jenkins states
+                // facts only (launchAttempted/launchSucceeded/podObserved/resultAvailable/
+                // technicalCode) -- it never decides problemClass/owner/route; WF1 maps
+                // these facts to that governance classification itself.
+                zap: ctx.zapStageEntered ? telemetry.zap : null
             ])
 
             reporter.send(payloadObject, ctx.reportBase, currentBuild)
