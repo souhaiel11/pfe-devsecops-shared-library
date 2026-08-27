@@ -1,6 +1,15 @@
 # Registering pfe-devsecops on the Jenkins controller
 
-**Status: NOT YET APPLIED.** This directory contains the config to register
+**Status: APPLIED.** `init.groovy.d/pfe-devsecops-library.groovy` was copied
+into the running `jenkins` container and the controller was restarted.
+Verified post-restart by reading (not modifying)
+`/var/jenkins_home/org.jenkinsci.plugins.workflow.libs.GlobalLibraries.xml`,
+which now contains the `pfe-devsecops` library pointing at this repo with
+the `github` credential. `pfe-app-test`'s last build is still `#133`
+(`builds/nextBuildNumber` = 134, unclaimed) -- the restart did not trigger
+any job.
+
+This directory still documents the config to register
 the shared library globally so projects only need `@Library('pfe-devsecops') _`
 with no repository URL. Applying it requires either a Jenkins UI action or a
 container-level change to the running `jenkins` controller (`docker exec` +
