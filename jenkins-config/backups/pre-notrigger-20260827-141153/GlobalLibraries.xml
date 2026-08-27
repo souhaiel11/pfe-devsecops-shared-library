@@ -1,0 +1,20 @@
+<?xml version='1.1' encoding='UTF-8'?>
+<org.jenkinsci.plugins.workflow.libs.GlobalLibraries plugin="pipeline-groovy-lib@798.v5cc688825312">
+  <libraries>
+    <org.jenkinsci.plugins.workflow.libs.LibraryConfiguration>
+      <name>pfe-devsecops</name>
+      <retriever class="org.jenkinsci.plugins.workflow.libs.SCMSourceRetriever">
+        <clone>false</clone>
+        <scm class="jenkins.plugins.git.GitSCMSource" plugin="git@5.10.1">
+          <remote>https://github.com/souhaiel11/pfe-devsecops-shared-library.git</remote>
+          <credentialsId>github</credentialsId>
+          <traits/>
+        </scm>
+      </retriever>
+      <defaultVersion>main</defaultVersion>
+      <implicit>false</implicit>
+      <allowVersionOverride>true</allowVersionOverride>
+      <includeInChangesets>true</includeInChangesets>
+    </org.jenkinsci.plugins.workflow.libs.LibraryConfiguration>
+  </libraries>
+</org.jenkinsci.plugins.workflow.libs.GlobalLibraries>
