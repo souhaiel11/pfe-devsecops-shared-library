@@ -216,6 +216,18 @@ class ScannerRunner implements Serializable {
     // ------------------------------------------------------------------
     // OWASP ZAP DAST
     // ------------------------------------------------------------------
+    /**
+     * QA-BUILD-135-R1 (Defect A/B/D): the launch (`kubectl run`) and the
+     * wait-for-completion are now two Groovy-visible steps instead of one
+     * opaque shell block. A failed launch is detected in seconds via its
+     * real exit code -- the 220x10s wait loop is only ever entered if the
+     * pod was actually accepted by the API server, so a launch failure can
+     * no longer masquerade as ~37 minutes of pointless polling.
+     *
+     * Every fact observed is written to telemetry.zap (see StageTelemetry)
+     * so the post-stage callback can emit truthful, content-aware status --
+     * never "COMPLETED" from bare file existence.
+     */
     void runZap(String k8sNamespace, String kubeconfigPath, String zapTargetUrl, String buildNumber, String reportBase) {
         steps.catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
             String zapPod = "zap-scan-${buildNumber}"
@@ -224,136 +236,210 @@ class ScannerRunner implements Serializable {
                 "REPORT_BASE=${reportBase}", "ZAP_POD=${zapPod}",
                 "ZAP_IMAGE=${PlatformConfig.ZAP_IMAGE}", "ZAP_TARGET_URL=${zapTargetUrl}"
             ]) {
-                // Verbatim port of the pfe-app-test in-pod probe (spider + active scan +
-                // JSON/HTML report), unchanged except the target URL now comes from the
-                // ZAP_TARGET_URL env var instead of being hardcoded in the script text.
-                steps.sh '''
-                    set +e
-                    mkdir -p "$REPORT_BASE"
+                steps.sh 'mkdir -p "$REPORT_BASE"'
 
-                    echo "=== Kubernetes access ==="
-                    if ! kubectl get svc -n "$K8S_NAMESPACE" >/dev/null 2>&1; then
-                      echo '{"site":[],"status":"zap_k8s_unreachable"}' > "$REPORT_BASE/zap-report.json"
-                      exit 0
-                    fi
+                steps.echo '=== Kubernetes access ==='
+                int k8sReachable = steps.sh(returnStatus: true, script: 'kubectl get svc -n "$K8S_NAMESPACE" >/dev/null 2>&1')
+                if (k8sReachable != 0) {
+                    steps.sh 'echo \'{"site":[],"status":"zap_k8s_unreachable"}\' > "$REPORT_BASE/zap-report.json"'
+                    telemetry.zap.technicalCode = 'ZAP_K8S_UNREACHABLE'
+                    telemetry.zap.diagnosticMessage = 'Kubernetes API unreachable from Jenkins (kubectl get svc failed) -- ZAP launch was never attempted.'
+                    return
+                }
 
-                    echo "=== Cleaning up previous pod ==="
-                    kubectl delete pod "$ZAP_POD" -n "$K8S_NAMESPACE" --ignore-not-found=true || true
+                steps.echo '=== Cleaning up previous pod ==='
+                steps.sh 'kubectl delete pod "$ZAP_POD" -n "$K8S_NAMESPACE" --ignore-not-found=true || true'
 
-                    echo "=== Launching ZAP pod (spider then active scan) ==="
-                    kubectl run "$ZAP_POD" \
-                      -n "$K8S_NAMESPACE" \
-                      --image="$ZAP_IMAGE" \
-                      --image-pull-policy=IfNotPresent \
-                      --restart=Never \
-                      --requests='memory=768Mi,cpu=500m' \
-                      --limits='memory=1536Mi,cpu=1' \
-                      --env="ZAP_TARGET_URL=$ZAP_TARGET_URL" \
-                      --command -- sh -lc '
-                        mkdir -p /zap/wrk && cd /zap/wrk
+                steps.echo '=== Launching ZAP pod (spider then active scan) ==='
+                telemetry.zap.launchAttempted = true
+                int launchExit = steps.sh(returnStatus: true, script: ZAP_LAUNCH_SCRIPT)
+                telemetry.zap.launchExitCode = launchExit
 
-                        /zap/zap.sh -daemon -host 0.0.0.0 -port 8090 \
-                          -config api.disablekey=true \
-                          -config api.addrs.addr.name=.* \
-                          -config api.addrs.addr.regex=true \
-                          -config database.recoverylog=false \
-                          > /zap/wrk/zap.log 2>&1 &
+                if (launchExit != 0) {
+                    String stderrTail = steps.sh(script: 'tail -c 2000 /tmp/zap-launch-stderr.log 2>/dev/null || true', returnStdout: true).trim()
+                    telemetry.zap.launchSucceeded = false
+                    telemetry.zap.launchErrorType = 'KUBECTL_RUN_FAILED'
+                    telemetry.zap.technicalCode = 'ZAP_POD_LAUNCH_FAILED'
+                    telemetry.zap.diagnosticMessage = stderrTail ?: "kubectl run exited ${launchExit}; see Jenkins console for detail."
+                    steps.echo "ZAP pod launch failed (exit ${launchExit}): ${stderrTail}"
+                    steps.sh 'echo \'{"site":[],"status":"zap_pod_launch_failed"}\' > "$REPORT_BASE/zap-report.json"'
+                    // Never enter the wait loop for a pod that was never created.
+                    steps.sh 'kubectl delete pod "$ZAP_POD" -n "$K8S_NAMESPACE" --ignore-not-found=true || true'
+                    return
+                }
 
-                        python3 - <<PY
-import urllib.request, urllib.parse, time, json, sys, os
+                telemetry.zap.launchSucceeded = true
+                telemetry.zap.scanStarted = true
+                telemetry.zap.podObserved = true
 
-base   = "http://127.0.0.1:8090"
-target = os.environ["ZAP_TARGET_URL"]
+                steps.echo '=== Waiting for ZAP report (up to 36 min) ==='
+                steps.sh ZAP_WAIT_AND_RETRIEVE_SCRIPT
 
-def call(path, params=None, timeout=30):
-    url = base + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    return urllib.request.urlopen(url, timeout=timeout).read().decode()
+                boolean reportUsable = steps.sh(
+                    returnStatus: true,
+                    script: 'test -s "$REPORT_BASE/zap-report.json" && ! grep -q "zap_report_missing\\|zap_k8s_unreachable\\|zap_pod_launch_failed" "$REPORT_BASE/zap-report.json"'
+                ) == 0
+                telemetry.zap.resultAvailable = reportUsable
+                if (!reportUsable) {
+                    telemetry.zap.technicalCode = 'ZAP_SCAN_POD_DISAPPEARED'
+                    telemetry.zap.diagnosticMessage = 'ZAP pod was created and the scan was launched, but no usable report was retrieved before the wait timeout -- the pod was no longer reachable at retrieval time.'
+                }
 
-for _ in range(240):
-    try:
-        call("/JSON/core/view/version/", timeout=3); print("ZAP_READY"); break
-    except Exception:
-        time.sleep(3)
-else:
-    print("ZAP_NOT_READY_AFTER_720S")
-    try:
-        print("ZAP_LOG_TAIL:")
-        print(open("/zap/wrk/zap.log").read()[-2000:])
-    except Exception as e2:
-        print("COULD_NOT_READ_LOG", e2)
-    sys.exit(1)
-
-try:
-    call("/JSON/core/action/accessUrl/", {"url": target, "followRedirects": "true"})
-    print("TARGET_ACCESSED")
-except Exception as e:
-    print("TARGET_ACCESS_ERROR", e)
-
-try:
-    sid = json.loads(call("/JSON/spider/action/scan/", {"url": target, "recurse": "true"}))["scan"]
-    while True:
-        st = json.loads(call("/JSON/spider/view/status/", {"scanId": sid}))["status"]
-        if int(st) >= 100: break
-        time.sleep(3)
-    print("SPIDER_DONE")
-except Exception as e:
-    print("SPIDER_ERROR", e)
-
-try:
-    aid = json.loads(call("/JSON/ascan/action/scan/", {"url": target, "recurse": "true"}))["scan"]
-    while True:
-        st = json.loads(call("/JSON/ascan/view/status/", {"scanId": aid}))["status"]
-        if int(st) >= 100: break
-        time.sleep(5)
-    print("ACTIVE_SCAN_DONE")
-except Exception as e:
-    print("ACTIVE_SCAN_ERROR", e)
-
-try:
-    open("/zap/wrk/zap-report.json","w").write(call("/OTHER/core/other/jsonreport/", timeout=60))
-    print("JSON_REPORT_CREATED")
-except Exception as e:
-    print("JSON_REPORT_ERROR", e)
-    open("/zap/wrk/zap-report.json","w").write(json.dumps({"site":[{"name":target,"alerts":[]}],"status":"zap_report_api_fallback"}))
-try:
-    open("/zap/wrk/zap-report.html","w").write(call("/OTHER/core/other/htmlreport/", timeout=60))
-    print("HTML_REPORT_CREATED")
-except Exception as e:
-    print("HTML_REPORT_ERROR", e)
-PY
-
-                        ls -lh /zap/wrk || true
-                        touch /zap/wrk/zap.done
-                        sleep 3600
-                      '
-
-                    echo "=== Waiting for ZAP report (up to 36 min) ==="
-                    for i in $(seq 1 220); do
-                      if kubectl exec "$ZAP_POD" -n "$K8S_NAMESPACE" -- test -f /zap/wrk/zap.done 2>/dev/null; then
-                        echo "ZAP done"; break
-                      fi
-                      echo "Waiting for ZAP... $i"; sleep 10
-                    done
-
-                    echo "=== ZAP logs ==="
-                    kubectl logs "$ZAP_POD" -n "$K8S_NAMESPACE" || true
-
-                    echo "=== Retrieving reports ==="
-                    kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.json" "$REPORT_BASE/zap-report.json" || true
-                    kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.html" "$REPORT_BASE/zap-report.html" || true
-                    kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap.log"        "$REPORT_BASE/zap.log"        || true
-
-                    if [ ! -s "$REPORT_BASE/zap-report.json" ]; then
-                      echo '{"site":[],"status":"zap_report_missing"}' > "$REPORT_BASE/zap-report.json"
-                    fi
-
-                    echo "=== Cleaning up ZAP pod ==="
-                    kubectl delete pod "$ZAP_POD" -n "$K8S_NAMESPACE" --ignore-not-found=true || true
-                    true
-                '''
+                steps.echo '=== Cleaning up ZAP pod ==='
+                steps.sh 'kubectl delete pod "$ZAP_POD" -n "$K8S_NAMESPACE" --ignore-not-found=true || true'
             }
         }
     }
+
+    /**
+     * Launch-only: submits the ZAP pod (spider + active scan probe, unchanged
+     * from the pre-migration in-pod script) and returns immediately once
+     * the pod object is submitted -- does not wait for the scan to finish.
+     *
+     * Launched via a full Pod manifest piped through `kubectl apply -f -`
+     * rather than `kubectl run` (Defect A: `kubectl run --requests`/`--limits`
+     * no longer exist in kubectl v1.35.1 -- "unknown flag: --requests" --
+     * confirmed on build #135, where the pod was silently never created).
+     * `kubectl run --overrides` was tried as a smaller fix and rejected: its
+     * JSON overrides *replace* the whole generated container object rather
+     * than merging into it, which silently discarded the container's
+     * command/env and would have produced a pod that starts but never runs
+     * the scan -- verified live against this environment's own cluster
+     * before landing on the apply-manifest approach, which has no such
+     * merge ambiguity (every field is explicit).
+     *
+     * stdout/stderr are captured to files so a failure's real message can be
+     * read back without relying on steps.sh's own captured text.
+     */
+    private static final String ZAP_LAUNCH_SCRIPT = '''
+        set +e
+        kubectl apply -n "$K8S_NAMESPACE" -f - > /tmp/zap-launch-stdout.log 2> /tmp/zap-launch-stderr.log <<PODSPEC_EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $ZAP_POD
+  namespace: $K8S_NAMESPACE
+spec:
+  restartPolicy: Never
+  containers:
+    - name: $ZAP_POD
+      image: $ZAP_IMAGE
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: ZAP_TARGET_URL
+          value: "$ZAP_TARGET_URL"
+      resources:
+        requests:
+          memory: "768Mi"
+          cpu: "500m"
+        limits:
+          memory: "1536Mi"
+          cpu: "1"
+      command: ["sh", "-lc"]
+      args:
+        - |
+          mkdir -p /zap/wrk && cd /zap/wrk
+
+          /zap/zap.sh -daemon -host 0.0.0.0 -port 8090 \
+            -config api.disablekey=true \
+            -config api.addrs.addr.name=.* \
+            -config api.addrs.addr.regex=true \
+            -config database.recoverylog=false \
+            > /zap/wrk/zap.log 2>&1 &
+
+          python3 - <<PY
+          import urllib.request, urllib.parse, time, json, sys, os
+
+          base   = "http://127.0.0.1:8090"
+          target = os.environ["ZAP_TARGET_URL"]
+
+          def call(path, params=None, timeout=30):
+              url = base + path
+              if params:
+                  url += "?" + urllib.parse.urlencode(params)
+              return urllib.request.urlopen(url, timeout=timeout).read().decode()
+
+          for _ in range(240):
+              try:
+                  call("/JSON/core/view/version/", timeout=3); print("ZAP_READY"); break
+              except Exception:
+                  time.sleep(3)
+          else:
+              print("ZAP_NOT_READY_AFTER_720S")
+              try:
+                  print("ZAP_LOG_TAIL:")
+                  print(open("/zap/wrk/zap.log").read()[-2000:])
+              except Exception as e2:
+                  print("COULD_NOT_READ_LOG", e2)
+              sys.exit(1)
+
+          try:
+              call("/JSON/core/action/accessUrl/", {"url": target, "followRedirects": "true"})
+              print("TARGET_ACCESSED")
+          except Exception as e:
+              print("TARGET_ACCESS_ERROR", e)
+
+          try:
+              sid = json.loads(call("/JSON/spider/action/scan/", {"url": target, "recurse": "true"}))["scan"]
+              while True:
+                  st = json.loads(call("/JSON/spider/view/status/", {"scanId": sid}))["status"]
+                  if int(st) >= 100: break
+                  time.sleep(3)
+              print("SPIDER_DONE")
+          except Exception as e:
+              print("SPIDER_ERROR", e)
+
+          try:
+              aid = json.loads(call("/JSON/ascan/action/scan/", {"url": target, "recurse": "true"}))["scan"]
+              while True:
+                  st = json.loads(call("/JSON/ascan/view/status/", {"scanId": aid}))["status"]
+                  if int(st) >= 100: break
+                  time.sleep(5)
+              print("ACTIVE_SCAN_DONE")
+          except Exception as e:
+              print("ACTIVE_SCAN_ERROR", e)
+
+          try:
+              open("/zap/wrk/zap-report.json","w").write(call("/OTHER/core/other/jsonreport/", timeout=60))
+              print("JSON_REPORT_CREATED")
+          except Exception as e:
+              print("JSON_REPORT_ERROR", e)
+              open("/zap/wrk/zap-report.json","w").write(json.dumps({"site":[{"name":target,"alerts":[]}],"status":"zap_report_api_fallback"}))
+          try:
+              open("/zap/wrk/zap-report.html","w").write(call("/OTHER/core/other/htmlreport/", timeout=60))
+              print("HTML_REPORT_CREATED")
+          except Exception as e:
+              print("HTML_REPORT_ERROR", e)
+          PY
+
+          ls -lh /zap/wrk || true
+          touch /zap/wrk/zap.done
+          sleep 3600
+PODSPEC_EOF
+        exit $?
+    '''
+
+    /** Only ever invoked once the launch has been confirmed to have returned exit 0 (a real pod object exists). */
+    private static final String ZAP_WAIT_AND_RETRIEVE_SCRIPT = '''
+        set +e
+        for i in $(seq 1 220); do
+          if kubectl exec "$ZAP_POD" -n "$K8S_NAMESPACE" -- test -f /zap/wrk/zap.done 2>/dev/null; then
+            echo "ZAP done"; break
+          fi
+          echo "Waiting for ZAP... $i"; sleep 10
+        done
+
+        echo "=== ZAP logs ==="
+        kubectl logs "$ZAP_POD" -n "$K8S_NAMESPACE" || true
+
+        echo "=== Retrieving reports ==="
+        kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.json" "$REPORT_BASE/zap-report.json" || true
+        kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.html" "$REPORT_BASE/zap-report.html" || true
+        kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap.log"        "$REPORT_BASE/zap.log"        || true
+
+        if [ ! -s "$REPORT_BASE/zap-report.json" ]; then
+          echo '{"site":[],"status":"zap_report_missing"}' > "$REPORT_BASE/zap-report.json"
+        fi
+        true
+    '''
 }
