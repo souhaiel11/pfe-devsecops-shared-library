@@ -6,6 +6,8 @@ import jenkins.model.Jenkins
 import org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject
 import org.jenkinsci.plugins.github_branch_source.GitHubSCMSource
 import org.jenkinsci.plugins.github_branch_source.OriginPullRequestDiscoveryTrait
+import hudson.model.ParametersDefinitionProperty
+import hudson.model.StringParameterDefinition
 
 def job = Jenkins.instance.getItemByFullName('pfe-app-test-multibranch', WorkflowMultiBranchProject.class)
 if (!job) {
@@ -26,4 +28,12 @@ job.sourcesList.each { branchSource ->
     branchSource.source.setTraits(traits)
 }
 if (changed) job.save()
+job.items.findAll { it.name.startsWith('PR-') }.each { prJob ->
+    def existing = prJob.getProperty(ParametersDefinitionProperty)
+    def definitions = existing?.parameterDefinitions?.findAll { it.name != 'PFE_VALIDATION_CONTEXT' } ?: []
+    definitions << new StringParameterDefinition('PFE_VALIDATION_CONTEXT', '', 'Opaque non-secret PR validation correlation supplied by the authenticated platform.')
+    prJob.removeProperty(ParametersDefinitionProperty)
+    prJob.addProperty(new ParametersDefinitionProperty(definitions))
+    prJob.save()
+}
 println "[pfe-pr-head-discovery] origin PR strategy=${changed ? 'updated to HEAD' : 'already HEAD'}"

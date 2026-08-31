@@ -55,6 +55,11 @@ def call(Closure body = null) {
                 name: 'CVSS_FAIL_THRESHOLD',
                 defaultValue: PlatformConfig.DEFAULT_CVSS_FAIL_THRESHOLD,
                 description: 'CVSS blocking threshold, used only when JENKINS_HARD_GATE=true.'
+            ),
+            string(
+                name: 'PFE_VALIDATION_CONTEXT',
+                defaultValue: '',
+                description: 'Opaque non-secret PR validation correlation supplied only by the authenticated platform.'
             )
         ])
     ])
@@ -79,7 +84,7 @@ def call(Closure body = null) {
             String zapTargetUrl = config.zapTargetUrl ?: "http://${applicationName}:8080"
 
             boolean isPR = env.CHANGE_ID != null
-            Map prValidation = isPR ? prValidationContext(currentBuild) : [:]
+            Map prValidation = isPR ? prValidationContext(params.PFE_VALIDATION_CONTEXT) : [:]
             if (isPR && !prValidation) {
                 error('PR_VALIDATION_CONTEXT_MISSING: launch PR validation through the authenticated platform action.')
             }
@@ -150,7 +155,11 @@ def call(Closure body = null) {
                     if (PlatformConfig.SONAR_ENABLED) {
                         stage('SonarQube Analysis') {
                             scanners.runSonar(applicationName, workingDirectory, isPR, env.CHANGE_ID, env.CHANGE_BRANCH, env.CHANGE_TARGET)
-                            if (isPR) scanners.resolveExactAnalysis()
+                            if (isPR) {
+                                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                    scanners.resolveExactAnalysis()
+                                }
+                            }
                         }
                     }
 
@@ -210,13 +219,8 @@ def call(Closure body = null) {
     }
 }
 
-private Map prValidationContext(def currentBuild) {
-    String prefix = 'PFE_PR_VALIDATION:'
-    def descriptions = currentBuild.rawBuild.getCauses().collect { String.valueOf(it.shortDescription ?: '') }
-    String encoded = descriptions.findResult { text ->
-        int index = text.indexOf(prefix)
-        index >= 0 ? text.substring(index + prefix.length()).trim() : null
-    }
+private Map prValidationContext(def rawContext) {
+    String encoded = String.valueOf(rawContext ?: '').trim()
     if (!encoded) return [:]
     try {
         String json = new String(Base64.urlDecoder.decode(encoded), 'UTF-8')
