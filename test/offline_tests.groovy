@@ -233,6 +233,98 @@ if (libRoot) {
     println 'R2-TEST K - SKIPPED (LIB_ROOT not set; run via test/run-offline-tests.sh)'
 }
 
+// ======================================================================
+// R40 defect-closure tests: PR-24 build #1 proved a real
+// NoSuchMethodError('String') CPS crash at devSecOpsPipeline.groovy:132,
+// plus a terminal-callback gap it exposed (Checkout/stage failures that
+// throw an Error, not just an Exception, previously skipped
+// reportToPlatform entirely, stranding the platform in QUEUED forever).
+// ======================================================================
+
+// ---- R40-TEST A: the fixed expectedPrHeadSha conversion is CPS-safe and
+// preserves exact SHA/null/case semantics (the actual logic from the fixed
+// line, replicated here the same way R2-TEST H replicates its fallback
+// chain rather than re-invoking the full Jenkins-coupled call()). ----
+def convertExpectedSha = { rawExpected ->
+    // Mirrors the fixed line 132 exactly: (value ?: '').toString().toLowerCase()
+    (rawExpected ?: '').toString().toLowerCase()
+}
+String realSha = '10E90DD5A0D21941DEA1A544C3026D0955A029B1'
+check(convertExpectedSha(realSha) == '10e90dd5a0d21941dea1a544c3026d0955a029b1',
+    'R40-TEST A - mixed-case expectedPrHeadSha lowercased correctly, full 40 chars preserved')
+check(convertExpectedSha(null) == '', 'R40-TEST A - null expectedPrHeadSha falls back to empty string, never fabricated/never throws')
+check(convertExpectedSha('') == '', 'R40-TEST A - empty expectedPrHeadSha stays empty')
+check(!(convertExpectedSha(null) ==~ /[a-f0-9]{40}/), 'R40-TEST A - null/absent SHA correctly fails the 40-hex gate (fail-closed, not skipped)')
+check(convertExpectedSha(realSha) ==~ /[a-f0-9]{40}/, 'R40-TEST A - a real 40-char SHA passes the exact-hex gate after conversion')
+
+// ---- R40-TEST B: no CPS-unsafe bare TypeName(...) constructor-style call
+// remains anywhere in the Shared Library (grep-verified, same technique as
+// R2-TEST K). `new String(...)` and `String.valueOf(...)` are excluded --
+// both are safe, qualified forms Jenkins CPS does not route through step
+// lookup; only a bare `String(`/`Integer(`/etc. call is CPS-unsafe. ----
+if (libRoot) {
+    def cpsUnsafePattern = /(?<!\bnew\s)(?<!\w)(String|Integer|Boolean|Long|Double|Float|BigDecimal|BigInteger)\s*\(/
+    def cpsOffenders = []
+    def scanFile = { File f, String label ->
+        f.readLines().eachWithIndex { String line, int i ->
+            if (line.trim().startsWith('//') || line.trim().startsWith('*')) return
+            // Exclude the safe qualified form Type.staticMethod(...), e.g. String.valueOf(...)
+            def stripped = line.replaceAll(/\b(String|Integer|Boolean|Long|Double|Float|BigDecimal|BigInteger)\.\w+\(/, '')
+            if (stripped =~ cpsUnsafePattern) cpsOffenders << "${label}:${i + 1}: ${line.trim()}"
+        }
+    }
+    new File(libRoot, 'src').eachFileRecurse { f -> if (f.name.endsWith('.groovy')) scanFile(f, f.name) }
+    def varsFile2 = new File(libRoot, 'vars/devSecOpsPipeline.groovy')
+    if (varsFile2.exists()) scanFile(varsFile2, 'devSecOpsPipeline.groovy')
+    check(cpsOffenders.isEmpty(), "R40-TEST B - no CPS-unsafe bare TypeName(...) call anywhere in the Shared Library${cpsOffenders ? ' (found: ' + cpsOffenders + ')' : ''}")
+} else {
+    println 'R40-TEST B - SKIPPED (LIB_ROOT not set; run via test/run-offline-tests.sh)'
+}
+
+// ---- R40-TEST C: technicalFailure construction for a post-checkout stage
+// failure (Build/Sonar/Docker/Trivy/OWASP/ZAP) -- mirrors the exact
+// reportToPlatform branch added for ctx.stageFailure, same convention as
+// R40-TEST A / R2-TEST H (isolated logic, not the full Jenkins-coupled call()). ----
+def buildTechnicalFailure = { boolean checkoutFailed, Map stageFailure ->
+    if (checkoutFailed) {
+        return [phase: 'SCM_CHECKOUT', technicalCode: 'SCM_CHECKOUT_NETWORK_FAILURE',
+                message: 'Git checkout did not complete -- see Jenkins console for the underlying git/network error.']
+    } else if (stageFailure) {
+        return [phase: 'PIPELINE_STAGE', technicalCode: stageFailure.technicalCode, message: stageFailure.message]
+    }
+    return null
+}
+def stageEx = [technicalCode: 'PIPELINE_STAGE_ERROR', message: 'No such DSL method \'String\' found among steps [...]']
+def stageFailureResult = buildTechnicalFailure(false, stageEx)
+check(stageFailureResult.phase == 'PIPELINE_STAGE', 'R40-TEST C - post-checkout stage failure reports phase=PIPELINE_STAGE, distinct from SCM_CHECKOUT')
+check(stageFailureResult.technicalCode == 'PIPELINE_STAGE_ERROR', 'R40-TEST C - stage failure technicalCode forwarded verbatim, never fabricated')
+check(buildTechnicalFailure(true, stageEx).phase == 'SCM_CHECKOUT',
+    'R40-TEST C - checkoutFailed still takes priority over stageFailure (mutually exclusive in practice, checkout-first ordering preserved)')
+check(buildTechnicalFailure(false, null) == null, 'R40-TEST C - no technicalFailure fabricated when neither checkout nor a later stage failed')
+
+// ---- R40-TEST D: an Error (not just an Exception) is catchable by
+// `catch (Throwable ...)`, proving the broadened catch actually closes the
+// gap that let NoSuchMethodError escape reportToPlatform on real build #1. ----
+boolean caughtAsThrowable = false
+try {
+    throw new NoSuchMethodError("No such DSL method 'String' found among steps [...]")
+} catch (Throwable t) {
+    caughtAsThrowable = true
+}
+check(caughtAsThrowable, 'R40-TEST D - catch (Throwable) catches NoSuchMethodError (an Error, not an Exception)')
+
+boolean caughtAsBareCatch = false
+try {
+    try {
+        throw new NoSuchMethodError('simulated CPS DSL lookup failure')
+    } catch (bareCatchVar) {
+        caughtAsBareCatch = true
+    }
+} catch (Error uncaught) {
+    caughtAsBareCatch = false
+}
+check(!caughtAsBareCatch, 'R40-TEST D - control case: an untyped Groovy catch (Exception-only) does NOT catch an Error, confirming the pre-fix gap was real')
+
 println ''
 if (failures == 0) {
     println 'ALL OFFLINE TESTS PASSED'

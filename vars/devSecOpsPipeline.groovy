@@ -129,79 +129,100 @@ def call(Closure body = null) {
                         telemetry.checkoutFullSha = capturedSha ?: (scmVars?.GIT_COMMIT ?: null)
                         telemetry.checkoutShortSha = telemetry.checkoutFullSha ? telemetry.checkoutFullSha.take(8) : null
                         if (isPR) {
-                            String expected = String(prValidation.expectedPrHeadSha ?: '').toLowerCase()
+                            String expected = (prValidation.expectedPrHeadSha ?: '').toString().toLowerCase()
                             if (!(expected ==~ /[a-f0-9]{40}/) || telemetry.checkoutFullSha?.toLowerCase() != expected) {
                                 error("PR_HEAD_SHA_MISMATCH: checkout does not match the persisted validation target")
                             }
                         }
                         echo "Commit: ${telemetry.checkoutShortSha ?: 'unknown'}"
                     }
-                } catch (checkoutEx) {
+                } catch (Throwable checkoutEx) {
+                    // Throwable, not a bare (Exception-only) catch: a CPS/DSL defect
+                    // (e.g. NoSuchMethodError) is a java.lang.Error, a sibling of
+                    // Exception under Throwable -- an untyped catch here would let it
+                    // escape uncaught, skip reportToPlatform entirely, and strand the
+                    // platform's validation request in QUEUED forever (proven by real
+                    // PR-24 build #1). Every failure class must reach the callback.
                     checkoutFailed = true
                     currentBuild.result = 'FAILURE'
                     echo "Checkout failed: ${checkoutEx.message}"
                 }
 
+                // Same rationale as the Checkout catch above, applied to every stage
+                // after it: Build/Sonar/Docker/Trivy/OWASP/ZAP were previously
+                // unprotected, so any exception OR error there would also abort the
+                // node body before reaching reportToPlatform. stageFailure carries a
+                // truthful phase/message for the callback -- never fabricated.
+                Map stageFailure = null
                 if (!checkoutFailed) {
-                    String buildType = detector.detectBuildType(workingDirectory)
-                    if (!buildType) {
-                        error("devSecOpsPipeline: could not auto-detect a supported build type (pom.xml/build.gradle/package.json) under '${workingDirectory ?: '.'}'. If the app lives in a subdirectory, set workingDirectory.")
-                    }
+                    try {
+                        String buildType = detector.detectBuildType(workingDirectory)
+                        if (!buildType) {
+                            error("devSecOpsPipeline: could not auto-detect a supported build type (pom.xml/build.gradle/package.json) under '${workingDirectory ?: '.'}'. If the app lives in a subdirectory, set workingDirectory.")
+                        }
 
-                    stage('Build') {
-                        buildRunner.run(buildType, skipTests, workingDirectory)
-                    }
+                        stage('Build') {
+                            buildRunner.run(buildType, skipTests, workingDirectory)
+                        }
 
-                    if (PlatformConfig.SONAR_ENABLED) {
-                        stage('SonarQube Analysis') {
-                            scanners.runSonar(applicationName, workingDirectory, isPR, env.CHANGE_ID, env.CHANGE_BRANCH, env.CHANGE_TARGET)
-                            if (isPR) {
-                                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                                    scanners.resolveExactAnalysis()
+                        if (PlatformConfig.SONAR_ENABLED) {
+                            stage('SonarQube Analysis') {
+                                scanners.runSonar(applicationName, workingDirectory, isPR, env.CHANGE_ID, env.CHANGE_BRANCH, env.CHANGE_TARGET)
+                                if (isPR) {
+                                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                        scanners.resolveExactAnalysis()
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    dockerfilePresent = detector.detectDockerfile(workingDirectory, config.dockerfile)
-                    if (dockerfilePresent) {
-                        stage('Docker Build') {
-                            dockerRunner.build(imageName, imageTag, config.dockerfile, workingDirectory)
-                        }
-                    }
-
-                    if (PlatformConfig.TRIVY_ENABLED && dockerfilePresent) {
-                        stage('Trivy Scan') {
-                            timeout(time: PlatformConfig.TIMEOUT_TRIVY_MINUTES, unit: 'MINUTES') {
-                                scanners.runTrivy(imageName, imageTag, env.BUILD_NUMBER, reportBase)
+                        dockerfilePresent = detector.detectDockerfile(workingDirectory, config.dockerfile)
+                        if (dockerfilePresent) {
+                            stage('Docker Build') {
+                                dockerRunner.build(imageName, imageTag, config.dockerfile, workingDirectory)
                             }
                         }
-                    }
 
-                    if (PlatformConfig.OWASP_ENABLED) {
-                        stage('OWASP Dependency Check') {
-                            timeout(time: PlatformConfig.TIMEOUT_OWASP_MINUTES, unit: 'MINUTES') {
-                                scanners.runOwasp(reportBase, params.JENKINS_HARD_GATE, params.CVSS_FAIL_THRESHOLD, workingDirectory)
+                        if (PlatformConfig.TRIVY_ENABLED && dockerfilePresent) {
+                            stage('Trivy Scan') {
+                                timeout(time: PlatformConfig.TIMEOUT_TRIVY_MINUTES, unit: 'MINUTES') {
+                                    scanners.runTrivy(imageName, imageTag, env.BUILD_NUMBER, reportBase)
+                                }
                             }
                         }
-                    }
 
-                    if (!isPR && PlatformConfig.ZAP_ENABLED_ON_BRANCH_BUILDS) {
-                        zapStageEntered = true
-                        stage('Kubernetes Target Check') {
-                            scanners.checkKubernetesTarget(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, applicationServiceName(zapTargetUrl))
-                        }
-                        stage('ZAP DAST Scan') {
-                            timeout(time: PlatformConfig.TIMEOUT_ZAP_MINUTES, unit: 'MINUTES') {
-                                scanners.runZap(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, zapTargetUrl, env.BUILD_NUMBER, reportBase)
+                        if (PlatformConfig.OWASP_ENABLED) {
+                            stage('OWASP Dependency Check') {
+                                timeout(time: PlatformConfig.TIMEOUT_OWASP_MINUTES, unit: 'MINUTES') {
+                                    scanners.runOwasp(reportBase, params.JENKINS_HARD_GATE, params.CVSS_FAIL_THRESHOLD, workingDirectory)
+                                }
                             }
                         }
-                    } else if (!isPR) {
-                        // ZAP_ENABLED_ON_BRANCH_BUILDS=false is mandatory platform policy, not
-                        // a project choice -- still worth a reachability signal for humans.
-                        stage('Kubernetes Target Check') {
-                            scanners.checkKubernetesTarget(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, applicationServiceName(zapTargetUrl))
+
+                        if (!isPR && PlatformConfig.ZAP_ENABLED_ON_BRANCH_BUILDS) {
+                            zapStageEntered = true
+                            stage('Kubernetes Target Check') {
+                                scanners.checkKubernetesTarget(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, applicationServiceName(zapTargetUrl))
+                            }
+                            stage('ZAP DAST Scan') {
+                                timeout(time: PlatformConfig.TIMEOUT_ZAP_MINUTES, unit: 'MINUTES') {
+                                    scanners.runZap(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, zapTargetUrl, env.BUILD_NUMBER, reportBase)
+                                }
+                            }
+                        } else if (!isPR) {
+                            // ZAP_ENABLED_ON_BRANCH_BUILDS=false is mandatory platform policy, not
+                            // a project choice -- still worth a reachability signal for humans.
+                            stage('Kubernetes Target Check') {
+                                scanners.checkKubernetesTarget(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, applicationServiceName(zapTargetUrl))
+                            }
                         }
+                    } catch (Throwable stageEx) {
+                        currentBuild.result = 'FAILURE'
+                        stageFailure = [
+                            technicalCode: 'PIPELINE_STAGE_ERROR',
+                            message      : stageEx.message ?: stageEx.class.name
+                        ]
+                        echo "Stage execution failed: ${stageEx.message}"
                     }
                 }
 
@@ -211,7 +232,7 @@ def call(Closure body = null) {
                 reportToPlatform(this, telemetry, cleanup, reporter, [
                     applicationName: applicationName, imageName: imageName, imageTag: imageTag,
                     isPR: isPR, reportBase: reportBase, n8nReportBase: n8nReportBase,
-                    checkoutFailed: checkoutFailed, zapTargetUrl: zapTargetUrl, zapStageEntered: zapStageEntered,
+                    checkoutFailed: checkoutFailed, stageFailure: stageFailure, zapTargetUrl: zapTargetUrl, zapStageEntered: zapStageEntered,
                     prValidation: prValidation, dockerfilePresent: dockerfilePresent
                 ])
             }
@@ -281,6 +302,17 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                     phase        : 'SCM_CHECKOUT',
                     technicalCode: 'SCM_CHECKOUT_NETWORK_FAILURE',
                     message      : 'Git checkout did not complete -- see Jenkins console for the underlying git/network error.'
+                ]
+            } else if (ctx.stageFailure) {
+                // Checkout succeeded (real SHA captured, real gate already enforced);
+                // something after it -- Build/Sonar/Docker/Trivy/OWASP/ZAP -- threw an
+                // uncaught exception or error. Stages already completed keep their real
+                // telemetry below (never wiped); stages never reached keep their
+                // UNKNOWN/NOT_ATTEMPTED defaults from StageTelemetry, never fabricated.
+                technicalFailure = [
+                    phase        : 'PIPELINE_STAGE',
+                    technicalCode: ctx.stageFailure.technicalCode,
+                    message      : ctx.stageFailure.message
                 ]
             }
 
