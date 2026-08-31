@@ -18,12 +18,12 @@ if (!job) {
 boolean changed = false
 job.sourcesList.each { branchSource ->
     if (!(branchSource.source instanceof GitHubSCMSource)) return
-    def traits = branchSource.source.traits.collect { trait ->
-        if (trait instanceof OriginPullRequestDiscoveryTrait && trait.strategyId != 2) {
+    def traits = branchSource.source.traits.collect { discoveryTrait ->
+        if (discoveryTrait instanceof OriginPullRequestDiscoveryTrait && discoveryTrait.strategyId != 2) {
             changed = true
             return new OriginPullRequestDiscoveryTrait(2)
         }
-        return trait
+        return discoveryTrait
     }
     branchSource.source.setTraits(traits)
 }
