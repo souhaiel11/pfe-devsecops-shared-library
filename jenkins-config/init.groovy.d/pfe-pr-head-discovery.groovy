@@ -37,3 +37,7 @@ job.items.findAll { it.name.startsWith('PR-') }.each { prJob ->
     prJob.save()
 }
 println "[pfe-pr-head-discovery] origin PR strategy=${changed ? 'updated to HEAD' : 'already HEAD'}"
+if (changed) {
+    job.scheduleBuild2(0)
+    println '[pfe-pr-head-discovery] branch indexing scheduled; NoTrigger prevents branch builds'
+}
