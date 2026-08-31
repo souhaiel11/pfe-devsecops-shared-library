@@ -6,6 +6,7 @@ import org.pfe.devsecops.DockerRunner
 import org.pfe.devsecops.ScannerRunner
 import org.pfe.devsecops.PlatformReporter
 import org.pfe.devsecops.SafeCleanup
+import groovy.json.JsonSlurperClassic
 
 /**
  * devSecOpsPipeline -- the entire DevSecOps CI/CD platform, invoked from a
@@ -74,16 +75,23 @@ def call(Closure body = null) {
             }
             String imageName = applicationName
             String workingDirectory = config.workingDirectory ?: null
-            boolean skipTests = config.containsKey('skipTests') ? config.skipTests : false
+            boolean configuredSkipTests = config.containsKey('skipTests') ? config.skipTests : false
             String zapTargetUrl = config.zapTargetUrl ?: "http://${applicationName}:8080"
 
             boolean isPR = env.CHANGE_ID != null
+            Map prValidation = isPR ? prValidationContext(currentBuild) : [:]
+            if (isPR && !prValidation) {
+                error('PR_VALIDATION_CONTEXT_MISSING: launch PR validation through the authenticated platform action.')
+            }
+            boolean skipTests = isPR ? false : configuredSkipTests
+            telemetry.prValidation = prValidation
             String imageTag = env.BUILD_NUMBER
             String reportBase = "${PlatformConfig.JENKINS_REPORT_ROOT}/${applicationName}/${env.BUILD_NUMBER}"
             String n8nReportBase = "${PlatformConfig.N8N_REPORT_ROOT}/${applicationName}/${env.BUILD_NUMBER}"
 
             boolean checkoutFailed = false
             boolean zapStageEntered = false
+            boolean dockerfilePresent = false
 
             withCredentials([
                 string(credentialsId: PlatformConfig.CRED_SONAR_TOKEN, variable: 'SONAR_TOKEN'),
@@ -115,6 +123,12 @@ def call(Closure body = null) {
                         String capturedSha = sh(script: 'git rev-parse HEAD 2>/dev/null || true', returnStdout: true).trim()
                         telemetry.checkoutFullSha = capturedSha ?: (scmVars?.GIT_COMMIT ?: null)
                         telemetry.checkoutShortSha = telemetry.checkoutFullSha ? telemetry.checkoutFullSha.take(8) : null
+                        if (isPR) {
+                            String expected = String(prValidation.expectedPrHeadSha ?: '').toLowerCase()
+                            if (!(expected ==~ /[a-f0-9]{40}/) || telemetry.checkoutFullSha?.toLowerCase() != expected) {
+                                error("PR_HEAD_SHA_MISMATCH: checkout does not match the persisted validation target")
+                            }
+                        }
                         echo "Commit: ${telemetry.checkoutShortSha ?: 'unknown'}"
                     }
                 } catch (checkoutEx) {
@@ -136,10 +150,11 @@ def call(Closure body = null) {
                     if (PlatformConfig.SONAR_ENABLED) {
                         stage('SonarQube Analysis') {
                             scanners.runSonar(applicationName, workingDirectory, isPR, env.CHANGE_ID, env.CHANGE_BRANCH, env.CHANGE_TARGET)
+                            if (isPR) scanners.resolveExactAnalysis()
                         }
                     }
 
-                    boolean dockerfilePresent = detector.detectDockerfile(workingDirectory, config.dockerfile)
+                    dockerfilePresent = detector.detectDockerfile(workingDirectory, config.dockerfile)
                     if (dockerfilePresent) {
                         stage('Docker Build') {
                             dockerRunner.build(imageName, imageTag, config.dockerfile, workingDirectory)
@@ -187,10 +202,31 @@ def call(Closure body = null) {
                 reportToPlatform(this, telemetry, cleanup, reporter, [
                     applicationName: applicationName, imageName: imageName, imageTag: imageTag,
                     isPR: isPR, reportBase: reportBase, n8nReportBase: n8nReportBase,
-                    checkoutFailed: checkoutFailed, zapTargetUrl: zapTargetUrl, zapStageEntered: zapStageEntered
+                    checkoutFailed: checkoutFailed, zapTargetUrl: zapTargetUrl, zapStageEntered: zapStageEntered,
+                    prValidation: prValidation, dockerfilePresent: dockerfilePresent
                 ])
             }
         }
+    }
+}
+
+private Map prValidationContext(def currentBuild) {
+    String prefix = 'PFE_PR_VALIDATION:'
+    def descriptions = currentBuild.rawBuild.getCauses().collect { String.valueOf(it.shortDescription ?: '') }
+    String encoded = descriptions.findResult { text ->
+        int index = text.indexOf(prefix)
+        index >= 0 ? text.substring(index + prefix.length()).trim() : null
+    }
+    if (!encoded) return [:]
+    try {
+        String json = new String(Base64.urlDecoder.decode(encoded), 'UTF-8')
+        Map value = (Map) new JsonSlurperClassic().parseText(json)
+        def required = ['validationRequestId','projectId','incidentId','fixRequestId','batchId','batchKey',
+                        'attemptCount','repository','prNumber','prHeadBranch','expectedPrHeadSha','jenkinsJob','prValidationJob']
+        if (required.any { value[it] == null || String.valueOf(value[it]).trim() == '' }) return [:]
+        return value
+    } catch (ignored) {
+        return [:]
     }
 }
 
@@ -286,6 +322,8 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                 buildStatus     : buildStatus,
                 severityHint    : severityHint,
                 durationMs      : currentBuild.duration,
+                prValidation    : ctx.prValidation,
+                checkoutSha     : telemetry.checkoutFullSha,
                 buildStageStatus: telemetry.buildStageStatus,
                 technicalFailure: technicalFailure,
                 pullRequest     : env.CHANGE_ID ? [
@@ -321,6 +359,22 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                 // these facts to that governance classification itself.
                 zap: ctx.zapStageEntered ? telemetry.zap : null
             ])
+
+            if (ctx.isPR) {
+                def stageStatus = { String key ->
+                    String value = String.valueOf(telemetry.buildStageStatus[key] ?: (key == 'tests' ? telemetry.tests.status : 'UNKNOWN')).toUpperCase()
+                    ['SUCCESS','COMPLETED','PASSED'].contains(value) ? 'PASSED' : value
+                }
+                payloadObject.requiredStages = [
+                    [stage:'build', required:true, status:stageStatus('build')],
+                    [stage:'tests', required:true, status:stageStatus('tests')],
+                    [stage:'sonar', required:true, status:stageStatus('sonar')],
+                    [stage:'docker', required:ctx.dockerfilePresent, status:stageStatus('docker')],
+                    [stage:'trivy', required:ctx.dockerfilePresent && PlatformConfig.TRIVY_ENABLED, status:stageStatus('trivy')],
+                    [stage:'owasp', required:PlatformConfig.OWASP_ENABLED, status:stageStatus('owasp')],
+                    [stage:'zap', required:false, status:stageStatus('zap')]
+                ]
+            }
 
             reporter.send(payloadObject, ctx.reportBase, currentBuild)
         } catch (ex) {

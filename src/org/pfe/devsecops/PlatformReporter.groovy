@@ -21,7 +21,7 @@ class PlatformReporter implements Serializable {
      * Incident Payload node already consumes this exact structure.
      */
     Map buildPayload(Map args) {
-        return [
+        Map payload = [
             event           : args.event,
             job             : args.job,
             build_number    : args.buildNumber,
@@ -45,6 +45,32 @@ class PlatformReporter implements Serializable {
             // Existing consumers reading only reports.available.zap are unaffected.
             zap             : args.zap
         ]
+        if (args.event == 'pr_validation') {
+            Map correlation = args.prValidation ?: [:]
+            payload.putAll([
+                validationRequestId: correlation.validationRequestId,
+                projectId          : correlation.projectId,
+                incidentId         : correlation.incidentId,
+                fixRequestId       : correlation.fixRequestId,
+                requestId          : correlation.fixRequestId,
+                batchId            : correlation.batchId,
+                batchKey           : correlation.batchKey,
+                attemptCount       : correlation.attemptCount,
+                repository         : correlation.repository,
+                prNumber           : correlation.prNumber,
+                prHeadBranch       : correlation.prHeadBranch,
+                expectedPrHeadSha  : correlation.expectedPrHeadSha,
+                checkoutSha        : args.checkoutSha,
+                jenkinsJob         : correlation.jenkinsJob,
+                prValidationJob    : correlation.prValidationJob,
+                jenkinsBuildNumber : args.buildNumber,
+                jenkinsBuildUrl    : args.buildUrl,
+                jenkinsStatus      : args.buildStatus,
+                ceTaskId           : args.sonar?.ceTaskId,
+                analysisId         : args.sonar?.analysisId
+            ])
+        }
+        return payload
     }
 
     /** Serializes, writes a copy alongside the Jenkins reports, and POSTs to n8n with retries. Never throws -- degrades currentBuild to UNSTABLE on repeated failure, exactly like the pre-migration behavior. */

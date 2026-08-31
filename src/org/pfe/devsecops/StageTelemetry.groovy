@@ -26,6 +26,7 @@ class StageTelemetry implements Serializable {
     /** Captured directly from `git rev-parse HEAD` right after a successful checkout -- never from env.GIT_COMMIT alone (QA-BUILD-135-R1: env.GIT_COMMIT proved unreliable from this scripted-library flow). */
     String checkoutFullSha = null
     String checkoutShortSha = null
+    Map prValidation = [:]
 
     /**
      * Factual ZAP execution diagnostics (QA-BUILD-135-R1 / Defect A+B+D). Every

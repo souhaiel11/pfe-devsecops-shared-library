@@ -1,5 +1,7 @@
 package org.pfe.devsecops
 
+import groovy.json.JsonSlurperClassic
+
 /**
  * PIPELINE_GENERIC scanner orchestration: SonarQube, Trivy, OWASP
  * Dependency-Check, Kubernetes target reachability, OWASP ZAP DAST.
@@ -63,6 +65,34 @@ class ScannerRunner implements Serializable {
                 telemetry.sonar.ceTaskId = ceTaskLine.replaceFirst(/^ce\/task\?id=/, '')
             }
         }
+    }
+
+    void resolveExactAnalysis() {
+        String ceTaskId = String.valueOf(telemetry.sonar.ceTaskId ?: '')
+        if (!ceTaskId) steps.error('SONAR_CE_TASK_ID_MISSING')
+        for (int attempt = 1; attempt <= 60; attempt++) {
+            String raw = steps.withEnv(["SONAR_CE_TASK_ID=${ceTaskId}", "SONAR_EXACT_HOST=${PlatformConfig.SONAR_HOST_URL}"]) {
+                steps.sh(
+                    script: '''
+                        set +x
+                        curl -sf --max-time 10 -u "$SONAR_TOKEN:" \
+                          "$SONAR_EXACT_HOST/api/ce/task?id=$SONAR_CE_TASK_ID"
+                    ''',
+                    returnStdout: true
+                ).trim()
+            }
+            Map task = ((Map) new JsonSlurperClassic().parseText(raw)).task as Map
+            String status = String.valueOf(task?.status ?: '').toUpperCase()
+            if (status == 'SUCCESS') {
+                String analysisId = String.valueOf(task.analysisId ?: '')
+                if (!analysisId) steps.error('SONAR_ANALYSIS_ID_MISSING')
+                telemetry.sonar.analysisId = analysisId
+                return
+            }
+            if (['FAILED', 'CANCELED'].contains(status)) steps.error("SONAR_CE_${status}")
+            steps.sleep(time: 2, unit: 'SECONDS')
+        }
+        steps.error('SONAR_CE_TIMEOUT')
     }
 
     // ------------------------------------------------------------------

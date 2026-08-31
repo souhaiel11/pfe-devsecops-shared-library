@@ -94,6 +94,24 @@ check(payload.logs_url == 'http://jenkins/job/pfe-app-test/134/consoleText', 'TE
 check(payload.build_number == '134', 'TEST L - build_number forwarded (WF1 normalizes camelCase/snake_case at the boundary)')
 check(payload.zap == null, 'TEST L - zap null (additive, not passed) does not break existing consumers reading old fields')
 
+def exactSha = '10e90dd5a0d21941dea1a544c3026d0955a029b1'
+def prPayload = reporter.buildPayload([
+    event: 'pr_validation', job: 'pfe-app-test-multibranch/PR-24', buildNumber: '1', buildUrl: 'http://jenkins/pr/24/1/',
+    branch: 'fix/test', commit: exactSha, checkoutSha: exactSha, buildStatus: 'SUCCESS', severityHint: 'LOW', durationMs: 1000,
+    buildStageStatus: [:], technicalFailure: null, pullRequest: [number:'24'], reports: [:], tests: [status:'SUCCESS'],
+    sonar: [ceTaskId:'ce-1', analysisId:'analysis-1'], docker: [:], kubernetes: [:], zap: null,
+    prValidation: [validationRequestId:'validation-1', projectId:'project-1', incidentId:'incident-1',
+        fixRequestId:'request-1', batchId:'batch-1', batchKey:'batch-1', attemptCount:7,
+        repository:'owner/repo', prNumber:24, prHeadBranch:'fix/test', expectedPrHeadSha:exactSha,
+        jenkinsJob:'pfe-app-test', prValidationJob:'pfe-app-test-multibranch/PR-24']
+])
+check(prPayload.expectedPrHeadSha == exactSha && prPayload.checkoutSha == exactSha,
+    'R21-TEST A - PR callback preserves both authoritative full SHA values')
+check(prPayload.validationRequestId == 'validation-1' && prPayload.batchId == 'batch-1' && prPayload.attemptCount == 7,
+    'R21-TEST B - PR callback preserves persisted validation/batch correlation')
+check(prPayload.ceTaskId == 'ce-1' && prPayload.analysisId == 'analysis-1',
+    'R21-TEST C - PR callback carries exact CE and analysis identities')
+
 // ======================================================================
 // QA-BUILD-135-R1 defect-closure tests (Defects A/B/C/D)
 // ======================================================================
