@@ -48,6 +48,12 @@ class PlatformReporter implements Serializable {
         if (args.event == 'pr_validation') {
             Map correlation = args.prValidation ?: [:]
             payload.putAll([
+                // R45 -- explicit, authoritative record of what this build actually
+                // did (PlatformConfig, not echoed from the request): never claim
+                // native Sonar PR analysis when Community exact-SHA mode ran.
+                sonarAnalysisMode        : PlatformConfig.SONAR_ANALYSIS_MODE,
+                baseSonarProjectKey      : correlation.baseSonarProjectKey,
+                validationSonarProjectKey: correlation.validationSonarProjectKey,
                 validationRequestId: correlation.validationRequestId,
                 projectId          : correlation.projectId,
                 incidentId         : correlation.incidentId,

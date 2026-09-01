@@ -24,18 +24,35 @@ class ScannerRunner implements Serializable {
     // ------------------------------------------------------------------
     // SonarQube
     // ------------------------------------------------------------------
+    // validationProjectKey: required only for isPullRequest in COMMUNITY_EXACT_SHA
+    // mode (dedicated per-PR project key -- see PlatformConfig.SONAR_ANALYSIS_MODE
+    // and R45). Ignored for standard branch analysis and for a future
+    // DEVELOPER_NATIVE_PR mode, which uses appName + sonar.pullrequest.* instead.
     void runSonar(String appName, String workingDirectory, boolean isPullRequest,
-                   String changeId, String changeBranch, String changeTarget) {
+                   String changeId, String changeBranch, String changeTarget,
+                   String validationProjectKey = null) {
         telemetry.buildStageStatus['sonar'] = 'FAILED'
         steps.dir(workingDirectory ?: '.') {
             steps.catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                 steps.withSonarQubeEnv(PlatformConfig.SONAR_ENV_NAME) {
+                    String projectKey = appName
                     String prArgs = ''
                     if (isPullRequest) {
-                        steps.echo "SonarQube: pull request mode #${changeId}"
-                        prArgs = " -Dsonar.pullrequest.key=${changeId}" +
-                                 " -Dsonar.pullrequest.branch=${changeBranch}" +
-                                 " -Dsonar.pullrequest.base=${changeTarget}"
+                        if (PlatformConfig.SONAR_ANALYSIS_MODE == 'DEVELOPER_NATIVE_PR') {
+                            steps.echo "SonarQube: native pull request mode #${changeId}"
+                            prArgs = " -Dsonar.pullrequest.key=${changeId}" +
+                                     " -Dsonar.pullrequest.branch=${changeBranch}" +
+                                     " -Dsonar.pullrequest.base=${changeTarget}"
+                        } else {
+                            // COMMUNITY_EXACT_SHA: standard analysis against a dedicated
+                            // per-PR project key, isolated from the main project's
+                            // history. Never sonar.pullrequest.* -- Community Edition
+                            // rejects it outright ("Developer Edition or above is
+                            // required"), proven on real PR-24 build #2.
+                            if (!validationProjectKey) steps.error('SONAR_VALIDATION_PROJECT_KEY_MISSING')
+                            projectKey = validationProjectKey
+                            steps.echo "SonarQube: COMMUNITY_EXACT_SHA mode, project ${projectKey}"
+                        }
                     } else {
                         steps.echo 'SonarQube: standard branch mode'
                     }
@@ -44,8 +61,8 @@ class ScannerRunner implements Serializable {
                         mvn sonar:sonar -B \
                           -DskipTests=true \
                           -Djacoco.skip=true \
-                          -Dsonar.projectKey="${appName}" \
-                          -Dsonar.projectName="${appName}" \
+                          -Dsonar.projectKey="${projectKey}" \
+                          -Dsonar.projectName="${projectKey}" \
                           -Dsonar.host.url="${PlatformConfig.SONAR_HOST_URL}" \
                           -Dsonar.token="\$SONAR_TOKEN" \
                           ${prArgs} 2>&1 | tee sonar-analysis.log

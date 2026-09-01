@@ -21,6 +21,15 @@ class PlatformConfig implements Serializable {
     // ---- SonarQube ----
     static final String SONAR_ENV_NAME = 'sq1'          // withSonarQubeEnv() name configured in Jenkins
     static final String SONAR_HOST_URL = 'http://sonarqube:9000'
+    // R45 -- explicit, never inferred from missing fields. This local instance
+    // is Community Edition (H2, no license): sonar.pullrequest.* is rejected
+    // outright ("Developer Edition or above is required"), proven on real
+    // PR-24 build #2. COMMUNITY_EXACT_SHA runs a standard analysis against a
+    // dedicated per-PR project key instead -- never native PR analysis, never
+    // claimed as such. Flip to DEVELOPER_NATIVE_PR only after a real Developer
+    // Edition migration (see the R44 stop report: no supported H2 migration
+    // path exists today).
+    static final String SONAR_ANALYSIS_MODE = 'COMMUNITY_EXACT_SHA' // or 'DEVELOPER_NATIVE_PR'
 
     // ---- Platform / n8n / backend ----
     static final String BACKEND_URL     = 'http://pfe-backend:3001'

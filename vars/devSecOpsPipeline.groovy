@@ -167,7 +167,7 @@ def call(Closure body = null) {
 
                         if (PlatformConfig.SONAR_ENABLED) {
                             stage('SonarQube Analysis') {
-                                scanners.runSonar(applicationName, workingDirectory, isPR, env.CHANGE_ID, env.CHANGE_BRANCH, env.CHANGE_TARGET)
+                                scanners.runSonar(applicationName, workingDirectory, isPR, env.CHANGE_ID, env.CHANGE_BRANCH, env.CHANGE_TARGET, prValidation.validationSonarProjectKey)
                                 if (isPR) {
                                     catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                                         scanners.resolveExactAnalysis()
@@ -248,6 +248,11 @@ private Map prValidationContext(def rawContext) {
         Map value = (Map) new JsonSlurperClassic().parseText(json)
         def required = ['validationRequestId','projectId','incidentId','fixRequestId','batchId','batchKey',
                         'attemptCount','repository','prNumber','prHeadBranch','expectedPrHeadSha','jenkinsJob','prValidationJob']
+        // COMMUNITY_EXACT_SHA needs the dedicated per-PR project key up front --
+        // fail closed here, not deep inside runSonar with a less legible error.
+        if (PlatformConfig.SONAR_ANALYSIS_MODE == 'COMMUNITY_EXACT_SHA') {
+            required = required + ['baseSonarProjectKey', 'validationSonarProjectKey']
+        }
         if (required.any { value[it] == null || String.valueOf(value[it]).trim() == '' }) return [:]
         return value
     } catch (ignored) {

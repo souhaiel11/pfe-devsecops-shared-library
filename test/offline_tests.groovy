@@ -13,6 +13,7 @@ import org.pfe.devsecops.BuildRunner
 import org.pfe.devsecops.StageTelemetry
 import org.pfe.devsecops.PlatformReporter
 import org.pfe.devsecops.ScannerRunner
+import org.pfe.devsecops.PlatformConfig
 
 int failures = 0
 
@@ -324,6 +325,64 @@ try {
     caughtAsBareCatch = false
 }
 check(!caughtAsBareCatch, 'R40-TEST D - control case: an untyped Groovy catch (Exception-only) does NOT catch an Error, confirming the pre-fix gap was real')
+
+// ---- R45-TEST A: COMMUNITY_EXACT_SHA mode runs Sonar against the dedicated
+// per-PR project key and never emits sonar.pullrequest.* (Community Edition
+// rejects it outright -- proven on real PR-24 build #2, see PlatformConfig). ----
+check(PlatformConfig.SONAR_ANALYSIS_MODE == 'COMMUNITY_EXACT_SHA',
+    'R45-TEST A - PlatformConfig currently pins COMMUNITY_EXACT_SHA (flip only after a real Developer Edition migration)')
+
+def communitySteps = new FakeSteps()
+communitySteps.metaClass.withSonarQubeEnv = { String name, Closure body -> body.call() }
+def communityTelemetry = new StageTelemetry()
+new ScannerRunner(communitySteps, communityTelemetry).runSonar(
+    'pfe-app-test', '.', true, '24', 'feature/x', 'main', 'pfe-app-test-pr-24')
+String communitySonarScript = communitySteps.shScripts.find { it.contains('mvn sonar:sonar') }
+check(communitySonarScript != null, 'R45-TEST A - PR build in COMMUNITY_EXACT_SHA mode still runs mvn sonar:sonar')
+check(communitySonarScript.contains('sonar.projectKey="pfe-app-test-pr-24"'),
+    'R45-TEST A - PR build uses the dedicated per-PR project key, never the base project key')
+check(!communitySonarScript.contains('sonar.pullrequest.'),
+    'R45-TEST A - no sonar.pullrequest.* property ever sent in COMMUNITY_EXACT_SHA mode')
+check(communityTelemetry.buildStageStatus['sonar'] == 'SUCCESS', 'R45-TEST A - stage reports SUCCESS on a normal run')
+
+// ---- R45-TEST B: a missing validationSonarProjectKey fails closed -- never
+// silently falls back to the base project key or to "latest analysis". ----
+def missingKeySteps = new FakeSteps()
+missingKeySteps.metaClass.withSonarQubeEnv = { String name, Closure body -> body.call() }
+def missingKeyTelemetry = new StageTelemetry()
+new ScannerRunner(missingKeySteps, missingKeyTelemetry).runSonar(
+    'pfe-app-test', '.', true, '24', 'feature/x', 'main', null)
+check(!missingKeySteps.shScripts.any { it.contains('mvn sonar:sonar') },
+    'R45-TEST B - no Sonar analysis is ever run when the per-PR project key is missing (fail closed, not skipped-as-pass)')
+check(missingKeyTelemetry.buildStageStatus['sonar'] == 'FAILED',
+    'R45-TEST B - sonar stage stays FAILED, never fabricated as SUCCESS, when the per-PR project key is missing')
+
+// ---- R45-TEST C: a standard (non-PR) branch build is unaffected by
+// COMMUNITY_EXACT_SHA -- it always analyzes the base project key. ----
+def branchSteps = new FakeSteps()
+branchSteps.metaClass.withSonarQubeEnv = { String name, Closure body -> body.call() }
+def branchTelemetry = new StageTelemetry()
+new ScannerRunner(branchSteps, branchTelemetry).runSonar('pfe-app-test', '.', false, null, null, null, null)
+String branchSonarScript = branchSteps.shScripts.find { it.contains('mvn sonar:sonar') }
+check(branchSonarScript != null && branchSonarScript.contains('sonar.projectKey="pfe-app-test"'),
+    'R45-TEST C - standard branch build analyzes the base project key, unaffected by the PR compatibility mode')
+check(!branchSonarScript.contains('sonar.pullrequest.'), 'R45-TEST C - no PR properties on a non-PR build either')
+
+// ---- R45-TEST D: prValidationContext's required-field list mirrors the
+// devSecOpsPipeline.groovy logic (isolated pure closure, same convention as
+// R40-TEST A/C -- the real method is script-scope private and CPS-transformed,
+// not directly callable offline). Verifies COMMUNITY_EXACT_SHA additionally
+// requires the two per-PR project-key fields and fails closed (returns [:],
+// never a partially-populated context) when either is absent. ----
+def prValidationRequiredFields = { String mode ->
+    def base = ['validationRequestId','projectId','incidentId','fixRequestId','batchId','batchKey',
+                'attemptCount','repository','prNumber','prHeadBranch','expectedPrHeadSha','jenkinsJob','prValidationJob']
+    return mode == 'COMMUNITY_EXACT_SHA' ? base + ['baseSonarProjectKey', 'validationSonarProjectKey'] : base
+}
+check(prValidationRequiredFields('COMMUNITY_EXACT_SHA').containsAll(['baseSonarProjectKey', 'validationSonarProjectKey']),
+    'R45-TEST D - COMMUNITY_EXACT_SHA requires the per-PR project-key fields up front')
+check(!prValidationRequiredFields('DEVELOPER_NATIVE_PR').contains('validationSonarProjectKey'),
+    'R45-TEST D - DEVELOPER_NATIVE_PR does not require the Community-only project-key fields')
 
 println ''
 if (failures == 0) {
