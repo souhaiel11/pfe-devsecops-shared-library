@@ -328,8 +328,27 @@ class ScannerRunner implements Serializable {
                 ) == 0
                 telemetry.zap.resultAvailable = reportUsable
                 if (!reportUsable) {
+                    // technicalCode stays ZAP_SCAN_POD_DISAPPEARED -- it is derived by
+                    // WF1 from the zap_report_missing stub status and maps to
+                    // TECHNICAL_BLOCKER / INFRASTRUCTURE-ADMIN (fail-closed, unchanged).
+                    // RCA-BUILD-138-R15.1: the message must state the REAL in-pod
+                    // reason when the pod left a zap.failed marker (e.g. the ZAP
+                    // daemon API never became ready) rather than always claiming
+                    // "the pod was no longer reachable".
+                    String inPodFailure = steps.sh(
+                        script: 'cat "$REPORT_BASE/zap-inpod-failure.txt" 2>/dev/null || true',
+                        returnStdout: true
+                    ).trim()
                     telemetry.zap.technicalCode = 'ZAP_SCAN_POD_DISAPPEARED'
-                    telemetry.zap.diagnosticMessage = 'ZAP pod was created and the scan was launched, but no usable report was retrieved before the wait timeout -- the pod was no longer reachable at retrieval time.'
+                    if (inPodFailure) {
+                        telemetry.zap.diagnosticMessage =
+                            'ZAP pod was created and the scan was launched, but no usable report was produced. ' +
+                            'In-pod failure marker: ' + inPodFailure.replaceAll('\\s+', ' ').take(400)
+                    } else {
+                        telemetry.zap.diagnosticMessage =
+                            'ZAP pod was created and the scan was launched, but no usable report was retrieved and ' +
+                            'the pod left no failure marker -- the pod was no longer reachable at retrieval time.'
+                    }
                 }
 
                 steps.echo '=== Cleaning up ZAP pod ==='
@@ -387,7 +406,15 @@ spec:
         - |
           mkdir -p /zap/wrk && cd /zap/wrk
 
-          /zap/zap.sh -daemon -host 0.0.0.0 -port 8090 \
+          # -silent : skip HeadlessBootstrap.checkForUpdates() on start-up.
+          # RCA-BUILD-138-R15.1: without it, ZAP 2.17.0 in -daemon mode blocks the
+          # bootstrap thread in ExtensionAutoUpdate.updateAddOnsInline ->
+          # waitForDownloadInstalls (thread dump proven) synchronously downloading
+          # ~24 add-on updates over a slow/rate-limited egress path -- the API
+          # listener on :8090 is never bound, so readiness never passes and the
+          # scan cannot start (ZAP_NOT_READY_AFTER_720S). -silent is ZAP's
+          # documented CI/offline flag; bundled add-ons already run a full scan.
+          /zap/zap.sh -daemon -host 0.0.0.0 -port 8090 -silent \
             -config api.disablekey=true \
             -config api.addrs.addr.name=.* \
             -config api.addrs.addr.regex=true \
@@ -406,18 +433,32 @@ spec:
                   url += "?" + urllib.parse.urlencode(params)
               return urllib.request.urlopen(url, timeout=timeout).read().decode()
 
-          for _ in range(240):
+          # RCA-BUILD-138-R15.1: the readiness failure must never be swallowed.
+          # Record the real exception (class + message, no secrets) so the cause
+          # is observable in the Jenkins console / kubectl logs.
+          readiness_error = "no attempt made"
+          for attempt in range(1, 241):
               try:
-                  call("/JSON/core/view/version/", timeout=3); print("ZAP_READY"); break
-              except Exception:
+                  call("/JSON/core/view/version/", timeout=3)
+                  print("ZAP_READY attempt=%d" % attempt); break
+              except Exception as exc:
+                  readiness_error = "%s: %s" % (type(exc).__name__, exc)
+                  if attempt == 1 or attempt % 20 == 0:
+                      print("ZAP_READINESS attempt=%d error=%s" % (attempt, readiness_error))
                   time.sleep(3)
           else:
-              print("ZAP_NOT_READY_AFTER_720S")
+              print("ZAP_NOT_READY_AFTER_720S last_error=%s" % readiness_error)
+              log_tail = ""
               try:
-                  print("ZAP_LOG_TAIL:")
-                  print(open("/zap/wrk/zap.log").read()[-2000:])
+                  log_tail = open("/zap/wrk/zap.log").read()[-2000:]
+                  print("ZAP_LOG_TAIL:"); print(log_tail)
               except Exception as e2:
                   print("COULD_NOT_READ_LOG", e2)
+              try:
+                  open("/zap/wrk/zap.failed", "w").write(
+                      "ZAP_NOT_READY_AFTER_720S last_error=%s\\n%s" % (readiness_error, log_tail))
+              except Exception:
+                  pass
               sys.exit(1)
 
           try:
@@ -457,27 +498,56 @@ spec:
               print("HTML_REPORT_CREATED")
           except Exception as e:
               print("HTML_REPORT_ERROR", e)
+
+          # RCA-BUILD-138-R15.1: completion marker must distinguish SUCCESS from
+          # FAILURE. zap.done only when a non-empty report exists; the parent
+          # Jenkins wait must never announce "ZAP done" for a scan that produced
+          # no report. (The ZAP_NOT_READY path above writes zap.failed and exits
+          # before reaching here.)
+          try:
+              if os.path.getsize("/zap/wrk/zap-report.json") > 0:
+                  open("/zap/wrk/zap.done", "w").write("ok")
+              else:
+                  open("/zap/wrk/zap.failed", "w").write("ZAP_REPORT_EMPTY")
+          except Exception as e:
+              open("/zap/wrk/zap.failed", "w").write("ZAP_REPORT_MARKER_ERROR %s" % e)
           PY
 
           ls -lh /zap/wrk || true
-          touch /zap/wrk/zap.done
           sleep 3600
 PODSPEC_EOF
         exit $?
     '''
 
-    /** Only ever invoked once the launch has been confirmed to have returned exit 0 (a real pod object exists). */
+    /**
+     * Only ever invoked once the launch has been confirmed to have returned exit 0 (a real pod object exists).
+     *
+     * RCA-BUILD-138-R15.1 (telemetry): the in-pod script now writes exactly one
+     * of two markers -- /zap/wrk/zap.done (report produced) or /zap/wrk/zap.failed
+     * (technical failure, with the reason). The wait loop stops on either and
+     * NEVER prints "ZAP done" for a failed scan; the zap.failed contents are
+     * copied out to $REPORT_BASE/zap-inpod-failure.txt for the Groovy caller.
+     */
     private static final String ZAP_WAIT_AND_RETRIEVE_SCRIPT = '''
         set +e
+        ZAP_OUTCOME="TIMEOUT"
         for i in $(seq 1 220); do
           if kubectl exec "$ZAP_POD" -n "$K8S_NAMESPACE" -- test -f /zap/wrk/zap.done 2>/dev/null; then
-            echo "ZAP done"; break
+            echo "ZAP scan finished in-pod: report produced (zap.done)"; ZAP_OUTCOME="DONE"; break
+          fi
+          if kubectl exec "$ZAP_POD" -n "$K8S_NAMESPACE" -- test -f /zap/wrk/zap.failed 2>/dev/null; then
+            echo "ZAP scan failed in-pod (zap.failed) -- NOT a completed scan"; ZAP_OUTCOME="FAILED"; break
           fi
           echo "Waiting for ZAP... $i"; sleep 10
         done
+        echo "ZAP_INPOD_OUTCOME=$ZAP_OUTCOME"
 
         echo "=== ZAP logs ==="
         kubectl logs "$ZAP_POD" -n "$K8S_NAMESPACE" || true
+
+        echo "=== In-pod failure marker (if any) ==="
+        kubectl exec "$ZAP_POD" -n "$K8S_NAMESPACE" -- sh -c 'cat /zap/wrk/zap.failed 2>/dev/null' > "$REPORT_BASE/zap-inpod-failure.txt" 2>/dev/null || true
+        cat "$REPORT_BASE/zap-inpod-failure.txt" 2>/dev/null || true
 
         echo "=== Retrieving reports ==="
         kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.json" "$REPORT_BASE/zap-report.json" || true
