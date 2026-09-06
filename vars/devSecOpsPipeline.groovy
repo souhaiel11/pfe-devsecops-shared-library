@@ -194,7 +194,13 @@ def call(Closure body = null) {
                         if (PlatformConfig.OWASP_ENABLED) {
                             stage('OWASP Dependency Check') {
                                 timeout(time: PlatformConfig.TIMEOUT_OWASP_MINUTES, unit: 'MINUTES') {
-                                    scanners.runOwasp(reportBase, params.JENKINS_HARD_GATE, params.CVSS_FAIL_THRESHOLD, workingDirectory)
+                                    boolean owaspHardGate = params.JENKINS_HARD_GATE == null
+                                        ? PlatformConfig.DEFAULT_JENKINS_HARD_GATE
+                                        : Boolean.valueOf(params.JENKINS_HARD_GATE.toString())
+                                    String owaspCvssThreshold = params.CVSS_FAIL_THRESHOLD?.toString()?.trim()
+                                        ?: PlatformConfig.DEFAULT_CVSS_FAIL_THRESHOLD
+                                    String owaspWorkingDirectory = workingDirectory ?: '.'
+                                    scanners.runOwasp(reportBase, owaspHardGate, owaspCvssThreshold, owaspWorkingDirectory)
                                 }
                             }
                         }
