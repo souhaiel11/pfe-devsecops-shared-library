@@ -89,8 +89,8 @@ def payload = reporter.buildPayload([
 ])
 def expectedKeys = ['event', 'job', 'build_number', 'build_url', 'logs_url', 'branch', 'commit', 'status',
                      'severity_hint', 'duration_ms', 'buildStageStatus', 'technicalFailure', 'pull_request',
-                     'reports', 'tests', 'sonar', 'docker', 'kubernetes', 'zap'] as Set
-check(payload.keySet() == expectedKeys, 'TEST L - canonical payload keys match the pre-migration WF1 contract, plus additive zap')
+                     'reports', 'tests', 'sonar', 'docker', 'kubernetes', 'zap', 'commitSha', 'commitShaDiagnostic'] as Set
+check(payload.keySet() == expectedKeys, 'TEST L - canonical payload keys match the pre-migration WF1 contract, plus additive zap and application SHA evidence')
 check(payload.logs_url == 'http://jenkins/job/pfe-app-test/134/consoleText', 'TEST L - logs_url derived correctly')
 check(payload.build_number == '134', 'TEST L - build_number forwarded (WF1 normalizes camelCase/snake_case at the boundary)')
 check(payload.zap == null, 'TEST L - zap null (additive, not passed) does not break existing consumers reading old fields')
@@ -383,6 +383,73 @@ check(prValidationRequiredFields('COMMUNITY_EXACT_SHA').containsAll(['baseSonarP
     'R45-TEST D - COMMUNITY_EXACT_SHA requires the per-PR project-key fields up front')
 check(!prValidationRequiredFields('DEVELOPER_NATIVE_PR').contains('validationSonarProjectKey'),
     'R45-TEST D - DEVELOPER_NATIVE_PR does not require the Community-only project-key fields')
+
+
+// Application SHA evidence: no real network, shell, or Jenkins execution.
+String applicationSha = 'a1' * 20
+String librarySha = 'b2' * 20
+def shaReporter = new PlatformReporter(new FakeSteps())
+['pipeline_success', 'pipeline_unstable', 'pipeline_failed'].each { event ->
+    def ordinary = shaReporter.buildPayload([
+        event: event, commit: applicationSha.take(8), checkoutSha: applicationSha,
+        librarySha: librarySha, GIT_COMMIT: librarySha, token: 'TEST_ONLY_SECRET_SENTINEL'
+    ])
+    check(ordinary.commitSha == applicationSha, "SHA - ${event} full application SHA")
+    check(ordinary.commit == applicationSha.take(8), "SHA - ${event} legacy commit preserved")
+    check(!ordinary.containsKey('checkoutSha') && !ordinary.containsKey('commitShaDiagnostic'),
+        "SHA - ${event} valid ordinary field shape")
+    String encoded = groovy.json.JsonOutput.toJson(ordinary)
+    check(new groovy.json.JsonSlurperClassic().parseText(encoded).commitSha == applicationSha,
+        "SHA - ${event} JSON retains exact 40 characters")
+    check(!encoded.contains(librarySha) && !encoded.contains('TEST_ONLY_SECRET_SENTINEL'),
+        "SHA - ${event} no library substitution or secret argument leakage")
+}
+[null, '', applicationSha.take(8), 'a' * 39, 'a' * 41, 'g' * 40,
+ ' ' + applicationSha, 'TEST_ONLY_SECRET_SENTINEL'].each { invalid ->
+    def rejected = shaReporter.buildPayload([
+        event: 'pipeline_failed', commit: applicationSha.take(8), checkoutSha: invalid,
+        librarySha: librarySha, GIT_COMMIT: librarySha
+    ])
+    check(rejected.commitSha == null && rejected.commit == applicationSha.take(8),
+        'SHA - absent/invalid SHA stays null, never expanded or replaced')
+    check(rejected.commitShaDiagnostic == 'APPLICATION_CHECKOUT_SHA_UNAVAILABLE_OR_INVALID',
+        'SHA - fixed safe diagnostic')
+    check(!groovy.json.JsonOutput.toJson(rejected).contains('TEST_ONLY_SECRET_SENTINEL'),
+        'SHA - rejected value never leaked')
+}
+check(shaReporter.buildPayload([event: 'pipeline_success', checkoutSha: applicationSha.toUpperCase()]).commitSha
+    == applicationSha.toUpperCase(), 'SHA - valid uppercase hexadecimal preserved')
+def candidate = shaReporter.buildPayload([
+    event: 'pr_validation', commit: applicationSha.take(8), checkoutSha: applicationSha,
+    prValidation: [expectedPrHeadSha: applicationSha], sonar: [:]
+])
+check(candidate.checkoutSha == applicationSha && candidate.expectedPrHeadSha == applicationSha
+    && !candidate.containsKey('commitSha') && !candidate.containsKey('commitShaDiagnostic'),
+    'SHA - PR exact candidate contract unchanged')
+
+// Exercise the real producer with a different environment/library revision.
+def appTelemetry = new StageTelemetry()
+appTelemetry.checkoutFullSha = applicationSha
+appTelemetry.checkoutShortSha = applicationSha.take(8)
+def reportingScript = new Expando(
+    env: [GIT_COMMIT: librarySha, GIT_BRANCH: 'origin/main', JOB_NAME: 'pfe-app-test', BUILD_NUMBER: '1'],
+    currentBuild: [currentResult: 'SUCCESS', duration: 0],
+    timeout: { Map options, Closure action -> action.call() }, echo: { Object message -> println(message) })
+def cleanupStub = new Expando(reportAvailable: { Object base, Object name -> false }, safeDeleteDir: { -> })
+Map captured = null
+def reporterStub = new Expando(buildPayload: { Map args -> shaReporter.buildPayload(args) },
+    send: { Map result, Object base, Object build -> captured = result })
+def pipelineScript = this.class.classLoader.loadClass('devSecOpsPipeline').newInstance()
+pipelineScript.reportToPlatform(reportingScript, appTelemetry, cleanupStub, reporterStub,
+    [isPR: false, checkoutFailed: false, zapStageEntered: false, applicationName: 'pfe-app-test'])
+check(captured?.commitSha == applicationSha && captured?.commit == applicationSha.take(8),
+    'SHA - real reportToPlatform forwards application telemetry despite different environment SHA')
+String producerSource = new File(System.getenv('LIB_ROOT'), 'vars/devSecOpsPipeline.groovy').text
+check(producerSource.contains('def scmVars = checkout(scm)')
+    && producerSource.contains('git rev-parse HEAD 2>/dev/null || true')
+    && producerSource.contains('telemetry.checkoutFullSha = capturedSha ?: (scmVars?.GIT_COMMIT ?: null)')
+    && producerSource.contains('checkoutSha     : telemetry.checkoutFullSha'),
+    'SHA - capture and forwarding remain tied to application checkout')
 
 println ''
 if (failures == 0) {

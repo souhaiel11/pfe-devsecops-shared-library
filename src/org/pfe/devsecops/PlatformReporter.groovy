@@ -45,6 +45,17 @@ class PlatformReporter implements Serializable {
             // Existing consumers reading only reports.available.zap are unaffected.
             zap             : args.zap
         ]
+        if (args.event in ['pipeline_success', 'pipeline_unstable', 'pipeline_failed']) {
+            // checkoutSha is telemetry.checkoutFullSha from the application checkout.
+            // Keep legacy commit unchanged; never promote a short or environment SHA.
+            String exactSha = args.checkoutSha instanceof CharSequence ? args.checkoutSha.toString() : null
+            boolean exactShaValid = exactSha != null && (exactSha ==~ /[a-fA-F0-9]{40}/)
+            payload.commitSha = exactShaValid ? exactSha : null
+            if (!exactShaValid) {
+                // Fixed diagnostic only; never disclose the rejected input.
+                payload.commitShaDiagnostic = 'APPLICATION_CHECKOUT_SHA_UNAVAILABLE_OR_INVALID'
+            }
+        }
         if (args.event == 'pr_validation') {
             Map correlation = args.prValidation ?: [:]
             payload.putAll([
