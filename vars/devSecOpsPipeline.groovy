@@ -386,14 +386,20 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                     available      : [trivy: trivyAvailable, zap: zapAvailable, owasp: owaspAvailable]
                 ],
                 tests : telemetry.tests,
-                // R80 -- exact-SHA/build bound so the backend can verify this
-                // evidence belongs to the SAME already-authenticated webhook
-                // call as checkoutSha/jenkinsBuildNumber, never a value
-                // asserted only inside the evidence block itself.
-                semanticTestEvidence: telemetry.semanticTestEvidence ? [
-                    evaluatedSha: telemetry.checkoutFullSha,
-                    buildNumber : env.BUILD_NUMBER,
-                    testcases   : telemetry.semanticTestEvidence.testcases,
+                // R80.1 -- generic envelope contract expected by the
+                // backend's adapter registry (resolveSemanticEvidenceAdapter
+                // picks an adapter purely by `reportFormat`; this Jenkins
+                // pipeline is a JUnit/Surefire/Maven producer, so it
+                // declares the one reportFormat it actually knows how to
+                // produce -- JUNIT_XML, matching JUnitSemanticEvidenceAdapter
+                // .reportFormat exactly). The exact-SHA/build binding the
+                // backend requires comes from THIS SAME already-authenticated
+                // webhook call's own checkoutSha/jenkinsBuildNumber fields,
+                // never from a value asserted only inside this block, so the
+                // payload itself carries only the raw testcase facts.
+                semanticEvidence: telemetry.semanticTestEvidence ? [
+                    reportFormat: 'JUNIT_XML',
+                    payload     : [ testcases: telemetry.semanticTestEvidence.testcases ],
                 ] : null,
                 sonar : [
                     project_key  : ctx.applicationName,

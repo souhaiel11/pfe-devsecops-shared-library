@@ -37,13 +37,22 @@ class PlatformReporter implements Serializable {
             pull_request    : args.pullRequest,
             reports         : args.reports,
             tests           : args.tests,
-            // R80 -- bounded raw <testcase> facts (never null-vs-absent
-            // ambiguous: absent when tests never ran/no evidence was
-            // produced, present-with-empty-list when they ran but nothing
-            // was found). Backend only ever trusts this when it also
-            // matches THIS SAME payload's own checkoutSha/jenkinsBuildNumber
-            // (added below for pr_validation) -- never on its own say-so.
-            semanticTestEvidence: args.semanticTestEvidence,
+            // R80.1 -- generic executed-semantic-evidence envelope
+            // ({reportFormat, payload}), consumed by the backend's
+            // resolveSemanticEvidenceAdapter() purely by the envelope's own
+            // declared reportFormat -- never a project/framework literal at
+            // this call site. Absent (null) when tests never ran/no
+            // evidence was produced; present when they ran, even with an
+            // empty payload.testcases list, so a caller can tell "ran,
+            // found nothing semantic" from "did not run at all". Backend
+            // only ever trusts this when it also matches THIS SAME
+            // payload's own checkoutSha/jenkinsBuildNumber (added below for
+            // pr_validation) -- never on its own say-so. NOTE: this field
+            // was named `semanticTestEvidence` (flat shape) before R80.1 --
+            // grep-verified (2026-09-20) to have zero consumers anywhere in
+            // backend/n8n-workflows, so it was renamed outright rather than
+            // dual-published.
+            semanticEvidence: args.semanticEvidence,
             sonar           : args.sonar,
             docker          : args.docker,
             kubernetes      : args.kubernetes,

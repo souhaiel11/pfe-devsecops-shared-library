@@ -90,8 +90,8 @@ def payload = reporter.buildPayload([
 def expectedKeys = ['event', 'job', 'build_number', 'build_url', 'logs_url', 'branch', 'commit', 'status',
                      'severity_hint', 'duration_ms', 'buildStageStatus', 'technicalFailure', 'pull_request',
                      'reports', 'tests', 'sonar', 'docker', 'kubernetes', 'zap', 'commitSha', 'commitShaDiagnostic',
-                     'semanticTestEvidence'] as Set
-check(payload.keySet() == expectedKeys, 'TEST L - canonical payload keys match the pre-migration WF1 contract, plus additive zap/SHA/R80 semantic-evidence fields')
+                     'semanticEvidence'] as Set
+check(payload.keySet() == expectedKeys, 'TEST L - canonical payload keys match the pre-migration WF1 contract, plus additive zap/SHA/R80.1 semantic-evidence-envelope fields')
 check(payload.logs_url == 'http://jenkins/job/pfe-app-test/134/consoleText', 'TEST L - logs_url derived correctly')
 check(payload.build_number == '134', 'TEST L - build_number forwarded (WF1 normalizes camelCase/snake_case at the boundary)')
 check(payload.zap == null, 'TEST L - zap null (additive, not passed) does not break existing consumers reading old fields')
@@ -538,23 +538,88 @@ new BuildRunner(r80AllBadSteps, r80AllBadTelemetry).run('maven', false, null)
 check(r80AllBadTelemetry.tests.status == 'UNKNOWN', 'R80 - zero parseable reports is honestly UNKNOWN, never fabricated')
 check(r80AllBadTelemetry.semanticTestEvidence == null, 'R80 - zero parseable reports leaves semanticTestEvidence null, not an empty-but-attempted list')
 
-// R80 - the report producer forwards semanticTestEvidence with exact-SHA/build binding
+// ==================================================================
+// R80.1 -- CROSS-REPO CONTRACT: emitted `semanticEvidence` envelope must
+// match the backend's ACTUAL expected wire contract exactly. This is a
+// static, unavoidable cross-repo risk (Groovy cannot import TypeScript),
+// so the expectation below is a literal transcription -- verified by
+// direct grep/read on 2026-09-20 against:
+//   platform backend commit 5f8410606395670b0f2f6fa1a9c44876072b74fb
+//     - incidents.service.ts:1265 reads `(validation as any).semanticEvidence`
+//     - adapters/registry.ts resolves purely by `envelope.reportFormat`
+//     - junit-semantic-evidence-adapter.ts:86 `readonly reportFormat = 'JUNIT_XML'`
+//     - JUnitSemanticEvidenceInput = { testcases: RawJUnitTestcase[] }
+// If EITHER side renames/reshapes this contract without updating the other,
+// this test (or the backend's own adapter/registry tests) must fail. Anyone
+// changing BACKEND_EXPECTED_FIELD/BACKEND_EXPECTED_REPORT_FORMAT below must
+// re-verify against the live backend source at the same time.
+// ==================================================================
+def BACKEND_EXPECTED_FIELD = 'semanticEvidence'
+def BACKEND_EXPECTED_REPORT_FORMAT = 'JUNIT_XML'
+
+// R80.1 - the report producer forwards the generic envelope with exact-SHA/build binding
 def r80ReporterTelemetry = new StageTelemetry()
 r80ReporterTelemetry.checkoutFullSha = 'a'.multiply(40)
 r80ReporterTelemetry.semanticTestEvidence = [testcases: [[classname: 'C', name: 'n', status: 'PASS']]]
 def r80PipelineSource = new File(System.getenv('LIB_ROOT'), 'vars/devSecOpsPipeline.groovy').text
-check(r80PipelineSource.contains('semanticTestEvidence: telemetry.semanticTestEvidence ? [')
-    && r80PipelineSource.contains('evaluatedSha: telemetry.checkoutFullSha')
-    && r80PipelineSource.contains('buildNumber : env.BUILD_NUMBER'),
-    'R80 - the payload assembler binds semanticTestEvidence to the SAME checkoutSha/BUILD_NUMBER as every other field on this payload')
-def r80ReporterPayload = new PlatformReporter(new FakeSteps()).buildPayload([
+check(r80PipelineSource.contains("${BACKEND_EXPECTED_FIELD}: telemetry.semanticTestEvidence ? [")
+    && r80PipelineSource.contains("reportFormat: '${BACKEND_EXPECTED_REPORT_FORMAT}'")
+    && r80PipelineSource.contains('payload     : [ testcases: telemetry.semanticTestEvidence.testcases ]'),
+    "R80.1 - the payload assembler emits ${BACKEND_EXPECTED_FIELD} as a {reportFormat, payload} envelope, not the old flat semanticTestEvidence shape")
+
+def r80ContractPayload = new PlatformReporter(new FakeSteps()).buildPayload([
     event: 'pipeline_success', job: 'x', buildNumber: '1', buildUrl: 'http://x/1/',
     branch: 'main', commit: 'abc', buildStatus: 'SUCCESS', severityHint: 'LOW', durationMs: 1,
     buildStageStatus: [:], technicalFailure: null, pullRequest: null,
     reports: [:], tests: [:], sonar: [:], docker: [:], kubernetes: [:],
-    semanticTestEvidence: [evaluatedSha: 'a'.multiply(40), buildNumber: '1', testcases: [[classname: 'C', name: 'n', status: 'PASS']]],
+    (BACKEND_EXPECTED_FIELD): [
+        reportFormat: BACKEND_EXPECTED_REPORT_FORMAT,
+        payload     : [ testcases: [[classname: 'C', name: 'n', status: 'PASS']] ],
+    ],
 ])
-check(r80ReporterPayload.semanticTestEvidence?.testcases?.size() == 1, 'R80 - PlatformReporter forwards semanticTestEvidence unchanged into the canonical payload')
+check(r80ContractPayload.containsKey(BACKEND_EXPECTED_FIELD),
+    "R80.1 CONTRACT - PlatformReporter's canonical payload carries the exact field name (${BACKEND_EXPECTED_FIELD}) the backend adapter registry reads")
+check(r80ContractPayload[BACKEND_EXPECTED_FIELD]?.reportFormat == BACKEND_EXPECTED_REPORT_FORMAT,
+    "R80.1 CONTRACT - envelope.reportFormat is the exact string ('${BACKEND_EXPECTED_REPORT_FORMAT}') registered by JUnitSemanticEvidenceAdapter, not a guessed/abbreviated variant")
+check(r80ContractPayload[BACKEND_EXPECTED_FIELD]?.payload?.testcases instanceof List
+    && r80ContractPayload[BACKEND_EXPECTED_FIELD]?.payload?.testcases?.size() == 1,
+    'R80.1 CONTRACT - envelope.payload.testcases is a List of raw {classname, name, status} facts, the exact shape JUnitSemanticEvidenceInput expects')
+check(!r80ContractPayload.containsKey('semanticTestEvidence'),
+    'R80.1 CONTRACT - the old flat semanticTestEvidence field is gone (grep-verified zero consumers anywhere in backend/n8n-workflows on 2026-09-20 -- replaced, not dual-published)')
+
+// R80.1 - end-to-end: a real 4-testcase build, through the FULL pipeline
+// wiring (BuildRunner -> StageTelemetry -> the exact envelope shape
+// devSecOpsPipeline.groovy assembles), must reach the shape the backend's
+// JUnitSemanticEvidenceAdapter (grammar: semantic_v1__<rule>__..__case_<id>)
+// can actually group into the 4 required DEFAULT_VALUE_SEMANTICS_DEFECT
+// cases -- proving this fix doesn't just satisfy a key-name check but
+// actually carries real, groupable semantic data end to end.
+def r80E2eSteps = new FakeSteps()
+r80E2eSteps.stdoutFor['ls target/surefire-reports/TEST-*.xml 2>/dev/null || true'] =
+    'target/surefire-reports/TEST-com.pfe.devsecops.controller.TaskControllerUpdateStatusSemanticsTest.xml'
+r80E2eSteps.fileContents['target/surefire-reports/TEST-com.pfe.devsecops.controller.TaskControllerUpdateStatusSemanticsTest.xml'] = '''<?xml version="1.0"?>
+<testsuite tests="4" failures="0" errors="0" skipped="0">
+  <testcase classname="com.pfe.devsecops.controller.TaskControllerUpdateStatusSemanticsTest" name="semantic_v1__DEFAULT_VALUE_SEMANTICS_DEFECT__Task__status__TaskDTO__status__case_ABSENT__resetsToBaselineDefault"/>
+  <testcase classname="com.pfe.devsecops.controller.TaskControllerUpdateStatusSemanticsTest" name="semantic_v1__DEFAULT_VALUE_SEMANTICS_DEFECT__Task__status__TaskDTO__status__case_EXPLICIT_NULL__setsNull"/>
+  <testcase classname="com.pfe.devsecops.controller.TaskControllerUpdateStatusSemanticsTest" name="semantic_v1__DEFAULT_VALUE_SEMANTICS_DEFECT__Task__status__TaskDTO__status__case_EXPLICIT_VALUE__isPersisted"/>
+  <testcase classname="com.pfe.devsecops.controller.TaskControllerUpdateStatusSemanticsTest" name="semantic_v1__DEFAULT_VALUE_SEMANTICS_DEFECT__Task__status__TaskDTO__status__case_INVALID_VALUE__isRejected"/>
+</testsuite>'''
+def r80E2eTelemetry = new StageTelemetry()
+new BuildRunner(r80E2eSteps, r80E2eTelemetry).run('maven', false, null)
+def r80E2ePayload = new PlatformReporter(new FakeSteps()).buildPayload([
+    event: 'pr_validation', job: 'x', buildNumber: '5', buildUrl: 'http://x/5/',
+    branch: 'PR-34', commit: '11ee62d', buildStatus: 'SUCCESS', severityHint: 'LOW', durationMs: 1,
+    buildStageStatus: [:], technicalFailure: null, pullRequest: null,
+    reports: [:], tests: [:], sonar: [:], docker: [:], kubernetes: [:],
+    (BACKEND_EXPECTED_FIELD): r80E2eTelemetry.semanticTestEvidence ? [
+        reportFormat: BACKEND_EXPECTED_REPORT_FORMAT,
+        payload     : [ testcases: r80E2eTelemetry.semanticTestEvidence.testcases ],
+    ] : null,
+])
+def r80E2eTestcases = r80E2ePayload[BACKEND_EXPECTED_FIELD]?.payload?.testcases
+check(r80E2eTestcases?.size() == 4, 'R80.1 E2E - all 4 real grammar-compliant testcases reach the final wire envelope')
+check(r80E2eTestcases?.every { it.name?.startsWith('semantic_v1__DEFAULT_VALUE_SEMANTICS_DEFECT__') && it.status == 'PASS' },
+    'R80.1 E2E - every grammar-compliant testcase is carried through with its real PASS status, unmodified, exactly as the backend JUnitSemanticEvidenceAdapter grammar parser expects')
 
 println ''
 if (failures == 0) {
