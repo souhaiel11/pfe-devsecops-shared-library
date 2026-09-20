@@ -37,6 +37,13 @@ class PlatformReporter implements Serializable {
             pull_request    : args.pullRequest,
             reports         : args.reports,
             tests           : args.tests,
+            // R80 -- bounded raw <testcase> facts (never null-vs-absent
+            // ambiguous: absent when tests never ran/no evidence was
+            // produced, present-with-empty-list when they ran but nothing
+            // was found). Backend only ever trusts this when it also
+            // matches THIS SAME payload's own checkoutSha/jenkinsBuildNumber
+            // (added below for pr_validation) -- never on its own say-so.
+            semanticTestEvidence: args.semanticTestEvidence,
             sonar           : args.sonar,
             docker          : args.docker,
             kubernetes      : args.kubernetes,

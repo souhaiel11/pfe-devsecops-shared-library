@@ -23,6 +23,16 @@ class StageTelemetry implements Serializable {
 
     Map tests = [status: 'UNKNOWN', total: null, failures: null, skipped: null, coverage: null]
 
+    /**
+     * R80 -- bounded, raw <testcase> facts extracted from the Surefire XML
+     * this same build produced, when tests actually ran. Null when tests
+     * were skipped or no XML was found. `testcases` never has semantic
+     * meaning assigned to it here -- this class states facts only, exactly
+     * like `tests`/`zap` above; the platform (backend) decides what a
+     * testcase name means, if anything.
+     */
+    Map semanticTestEvidence = null
+
     /** Captured directly from `git rev-parse HEAD` right after a successful checkout -- never from env.GIT_COMMIT alone (QA-BUILD-135-R1: env.GIT_COMMIT proved unreliable from this scripted-library flow). */
     String checkoutFullSha = null
     String checkoutShortSha = null
@@ -70,6 +80,7 @@ class StageTelemetry implements Serializable {
             trivy : 'NOT_REACHED', owasp: 'NOT_REACHED', zap  : 'NOT_REACHED', docker: 'NOT_REACHED'
         ]
         tests = [status: 'NOT_REACHED', total: null, failures: null, skipped: null, coverage: null]
+        semanticTestEvidence = null
         docker.build_status = 'NOT_REACHED'
     }
 }

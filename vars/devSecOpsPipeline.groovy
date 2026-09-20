@@ -386,6 +386,15 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                     available      : [trivy: trivyAvailable, zap: zapAvailable, owasp: owaspAvailable]
                 ],
                 tests : telemetry.tests,
+                // R80 -- exact-SHA/build bound so the backend can verify this
+                // evidence belongs to the SAME already-authenticated webhook
+                // call as checkoutSha/jenkinsBuildNumber, never a value
+                // asserted only inside the evidence block itself.
+                semanticTestEvidence: telemetry.semanticTestEvidence ? [
+                    evaluatedSha: telemetry.checkoutFullSha,
+                    buildNumber : env.BUILD_NUMBER,
+                    testcases   : telemetry.semanticTestEvidence.testcases,
+                ] : null,
                 sonar : [
                     project_key  : ctx.applicationName,
                     dashboard_url: "${PlatformConfig.SONAR_HOST_URL}/dashboard?id=${ctx.applicationName}",

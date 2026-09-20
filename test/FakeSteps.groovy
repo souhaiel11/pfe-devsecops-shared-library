@@ -56,4 +56,17 @@ class FakeSteps {
     def error(String msg) { throw new RuntimeException(msg) }
 
     def fileExists(String path) { false }
+
+    // R80 -- minimal stand-ins for the two new steps BuildRunner's
+    // publishSemanticTestEvidence() calls. junitCalls records every
+    // invocation so a test can assert it was actually called (and with
+    // what args) without needing a real Jenkins junit publisher.
+    List<Map> junitCalls = []
+    def junit(Map args) { junitCalls << args; return null }
+
+    Map<String, String> fileContents = [:]
+    def readFile(String path) {
+        if (!fileContents.containsKey(path)) throw new java.io.FileNotFoundException(path)
+        return fileContents[path]
+    }
 }

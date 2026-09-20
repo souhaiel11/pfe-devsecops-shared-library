@@ -89,8 +89,9 @@ def payload = reporter.buildPayload([
 ])
 def expectedKeys = ['event', 'job', 'build_number', 'build_url', 'logs_url', 'branch', 'commit', 'status',
                      'severity_hint', 'duration_ms', 'buildStageStatus', 'technicalFailure', 'pull_request',
-                     'reports', 'tests', 'sonar', 'docker', 'kubernetes', 'zap', 'commitSha', 'commitShaDiagnostic'] as Set
-check(payload.keySet() == expectedKeys, 'TEST L - canonical payload keys match the pre-migration WF1 contract, plus additive zap and application SHA evidence')
+                     'reports', 'tests', 'sonar', 'docker', 'kubernetes', 'zap', 'commitSha', 'commitShaDiagnostic',
+                     'semanticTestEvidence'] as Set
+check(payload.keySet() == expectedKeys, 'TEST L - canonical payload keys match the pre-migration WF1 contract, plus additive zap/SHA/R80 semantic-evidence fields')
 check(payload.logs_url == 'http://jenkins/job/pfe-app-test/134/consoleText', 'TEST L - logs_url derived correctly')
 check(payload.build_number == '134', 'TEST L - build_number forwarded (WF1 normalizes camelCase/snake_case at the boundary)')
 check(payload.zap == null, 'TEST L - zap null (additive, not passed) does not break existing consumers reading old fields')
@@ -450,6 +451,110 @@ check(producerSource.contains('def scmVars = checkout(scm)')
     && producerSource.contains('telemetry.checkoutFullSha = capturedSha ?: (scmVars?.GIT_COMMIT ?: null)')
     && producerSource.contains('checkoutSha     : telemetry.checkoutFullSha'),
     'SHA - capture and forwarding remain tied to application checkout')
+
+// ---- R80: publishSemanticTestEvidence() -- structured JUnit publication + raw testcase extraction ----
+def r80Steps = new FakeSteps()
+r80Steps.stdoutFor['ls target/surefire-reports/TEST-*.xml 2>/dev/null || true'] =
+    'target/surefire-reports/TEST-com.example.FooTest.xml\ntarget/surefire-reports/TEST-com.example.BarTest.xml'
+r80Steps.fileContents['target/surefire-reports/TEST-com.example.FooTest.xml'] = '''<?xml version="1.0"?>
+<testsuite tests="2" failures="1" errors="0" skipped="0">
+  <testcase classname="com.example.FooTest" name="passingCase" time="0.01"/>
+  <testcase classname="com.example.FooTest" name="failingCase" time="0.01"><failure message="boom">stack</failure></testcase>
+</testsuite>'''
+r80Steps.fileContents['target/surefire-reports/TEST-com.example.BarTest.xml'] = '''<?xml version="1.0"?>
+<testsuite tests="2" failures="0" errors="1" skipped="1">
+  <testcase classname="com.example.BarTest" name="erroredCase" time="0.01"><error message="oops">stack</error></testcase>
+  <testcase classname="com.example.BarTest" name="skippedCase" time="0.0"><skipped/></testcase>
+</testsuite>'''
+def r80Telemetry = new StageTelemetry()
+new BuildRunner(r80Steps, r80Telemetry).run('maven', false, null)
+
+check(r80Steps.junitCalls.size() == 1, 'R80 - junit publisher step is actually invoked when tests run')
+check(r80Steps.junitCalls[0].testResults == 'target/surefire-reports/*.xml', 'R80 - junit step targets the real Surefire XML glob')
+check(r80Steps.junitCalls[0].allowEmptyResults == true, 'R80 - junit step never fails the build over zero results on its own')
+
+// R80 §10 -- the KNOWN BUG: the old tail-1 console-text scrape only ever
+// saw ONE class's own count (proven live: build #4 really ran 17 tests,
+// platform reported 10). The aggregate must now come from summing every
+// <testsuite>'s OWN tests/failures/errors/skipped attributes across every
+// XML file -- not from re-counting <testcase> children, and never from
+// console text.
+check(r80Telemetry.tests.total == 4, 'R80 §10 - aggregate total is the SUM across every XML file (2+2=4), never just the last file alphabetically (the proven bug)')
+check(r80Telemetry.tests.failures == 2, 'R80 §10 - failures aggregate sums failures+errors across every file (1 failure + 1 error)')
+check(r80Telemetry.tests.skipped == 1, 'R80 §10 - skipped aggregate sums across every file')
+check(r80Telemetry.tests.status == 'FAILED', 'R80 §10 - a nonzero aggregate failure count is reported FAILED, never fabricated SUCCESS')
+
+def r80Cases = r80Telemetry.semanticTestEvidence?.testcases
+check(r80Cases != null, 'R80 - semanticTestEvidence.testcases is populated (not null) when tests ran')
+check(r80Cases?.size() == 4, 'R80 - all four real <testcase> entries extracted across both XML files')
+check(r80Cases?.find { it.name == 'passingCase' }?.status == 'PASS', 'R80 - a clean <testcase> is reported PASS')
+check(r80Cases?.find { it.name == 'failingCase' }?.status == 'FAILURE', 'R80 - a <failure> child is reported FAILURE, never PASS')
+check(r80Cases?.find { it.name == 'erroredCase' }?.status == 'ERROR', 'R80 - an <error> child is reported ERROR')
+check(r80Cases?.find { it.name == 'skippedCase' }?.status == 'SKIPPED', 'R80 - a <skipped> child is reported SKIPPED')
+check(r80Cases?.every { it.classname && it.name }, 'R80 - every extracted testcase carries both classname and name (the only two fields Surefire XML actually preserves)')
+
+// R80 §10 -- the REAL build #4 shape: 3 classes, 17 tests total (3 + 10 + 4), proving 17 not 10.
+def r80RealShapeSteps = new FakeSteps()
+r80RealShapeSteps.stdoutFor['ls target/surefire-reports/TEST-*.xml 2>/dev/null || true'] =
+    'target/surefire-reports/TEST-com.pfe.devsecops.controller.AuthControllerTest.xml\n' +
+    'target/surefire-reports/TEST-com.pfe.devsecops.controller.TaskControllerUpdateStatusSemanticsTest.xml\n' +
+    'target/surefire-reports/TEST-com.pfe.devsecops.service.TaskServiceTest.xml'
+r80RealShapeSteps.fileContents['target/surefire-reports/TEST-com.pfe.devsecops.controller.AuthControllerTest.xml'] =
+    '<testsuite tests="3" failures="0" errors="0" skipped="0"></testsuite>'
+r80RealShapeSteps.fileContents['target/surefire-reports/TEST-com.pfe.devsecops.controller.TaskControllerUpdateStatusSemanticsTest.xml'] =
+    '<testsuite tests="4" failures="0" errors="0" skipped="0"></testsuite>'
+r80RealShapeSteps.fileContents['target/surefire-reports/TEST-com.pfe.devsecops.service.TaskServiceTest.xml'] =
+    '<testsuite tests="10" failures="0" errors="0" skipped="0"></testsuite>'
+def r80RealShapeTelemetry = new StageTelemetry()
+new BuildRunner(r80RealShapeSteps, r80RealShapeTelemetry).run('maven', false, null)
+check(r80RealShapeTelemetry.tests.total == 17, 'R80 §10 - the real build #4 shape (3+4+10) now aggregates to 17, not the previously-reported 10')
+
+// R80 - skipTests=true must never publish/extract anything fabricated
+def r80SkipSteps = new FakeSteps()
+def r80SkipTelemetry = new StageTelemetry()
+new BuildRunner(r80SkipSteps, r80SkipTelemetry).run('maven', true, null)
+check(r80SkipSteps.junitCalls.isEmpty(), 'R80 - junit publisher is never called when tests are deliberately skipped')
+check(r80SkipTelemetry.semanticTestEvidence == null, 'R80 - semanticTestEvidence stays null (not an empty list) when tests never ran at all')
+
+// R80 - a malformed XML file alongside a good one: the good file's data
+// still comes through, the malformed one is skipped, never crashes.
+def r80BadXmlSteps = new FakeSteps()
+r80BadXmlSteps.stdoutFor['ls target/surefire-reports/TEST-*.xml 2>/dev/null || true'] =
+    'target/surefire-reports/TEST-com.example.BrokenTest.xml\ntarget/surefire-reports/TEST-com.example.GoodTest.xml'
+r80BadXmlSteps.fileContents['target/surefire-reports/TEST-com.example.BrokenTest.xml'] = 'not even xml <<<'
+r80BadXmlSteps.fileContents['target/surefire-reports/TEST-com.example.GoodTest.xml'] =
+    '<testsuite tests="1" failures="0" errors="0" skipped="0"><testcase classname="com.example.GoodTest" name="onlyCase"/></testsuite>'
+def r80BadXmlTelemetry = new StageTelemetry()
+new BuildRunner(r80BadXmlSteps, r80BadXmlTelemetry).run('maven', false, null)
+check(r80BadXmlTelemetry.tests.total == 1, 'R80 - a malformed XML file is skipped without crashing; the good file alongside it is still aggregated')
+check(r80BadXmlTelemetry.semanticTestEvidence?.testcases?.size() == 1, 'R80 - the good file testcase still reaches semanticTestEvidence despite a sibling malformed file')
+
+// R80 - every file unparseable -> honest UNKNOWN/null, never a fabricated empty-but-attempted result
+def r80AllBadSteps = new FakeSteps()
+r80AllBadSteps.stdoutFor['ls target/surefire-reports/TEST-*.xml 2>/dev/null || true'] = 'target/surefire-reports/TEST-com.example.BrokenTest.xml'
+r80AllBadSteps.fileContents['target/surefire-reports/TEST-com.example.BrokenTest.xml'] = 'not even xml <<<'
+def r80AllBadTelemetry = new StageTelemetry()
+new BuildRunner(r80AllBadSteps, r80AllBadTelemetry).run('maven', false, null)
+check(r80AllBadTelemetry.tests.status == 'UNKNOWN', 'R80 - zero parseable reports is honestly UNKNOWN, never fabricated')
+check(r80AllBadTelemetry.semanticTestEvidence == null, 'R80 - zero parseable reports leaves semanticTestEvidence null, not an empty-but-attempted list')
+
+// R80 - the report producer forwards semanticTestEvidence with exact-SHA/build binding
+def r80ReporterTelemetry = new StageTelemetry()
+r80ReporterTelemetry.checkoutFullSha = 'a'.multiply(40)
+r80ReporterTelemetry.semanticTestEvidence = [testcases: [[classname: 'C', name: 'n', status: 'PASS']]]
+def r80PipelineSource = new File(System.getenv('LIB_ROOT'), 'vars/devSecOpsPipeline.groovy').text
+check(r80PipelineSource.contains('semanticTestEvidence: telemetry.semanticTestEvidence ? [')
+    && r80PipelineSource.contains('evaluatedSha: telemetry.checkoutFullSha')
+    && r80PipelineSource.contains('buildNumber : env.BUILD_NUMBER'),
+    'R80 - the payload assembler binds semanticTestEvidence to the SAME checkoutSha/BUILD_NUMBER as every other field on this payload')
+def r80ReporterPayload = new PlatformReporter(new FakeSteps()).buildPayload([
+    event: 'pipeline_success', job: 'x', buildNumber: '1', buildUrl: 'http://x/1/',
+    branch: 'main', commit: 'abc', buildStatus: 'SUCCESS', severityHint: 'LOW', durationMs: 1,
+    buildStageStatus: [:], technicalFailure: null, pullRequest: null,
+    reports: [:], tests: [:], sonar: [:], docker: [:], kubernetes: [:],
+    semanticTestEvidence: [evaluatedSha: 'a'.multiply(40), buildNumber: '1', testcases: [[classname: 'C', name: 'n', status: 'PASS']]],
+])
+check(r80ReporterPayload.semanticTestEvidence?.testcases?.size() == 1, 'R80 - PlatformReporter forwards semanticTestEvidence unchanged into the canonical payload')
 
 println ''
 if (failures == 0) {

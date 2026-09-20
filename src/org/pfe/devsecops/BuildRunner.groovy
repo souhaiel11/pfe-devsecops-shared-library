@@ -45,29 +45,93 @@ class BuildRunner implements Serializable {
                 // Explicit SKIPPED, consumed as-is by WF1 (mapped to NOT_RUN, never PASSED).
                 telemetry.tests = [status: 'SKIPPED', total: 0, failures: 0, skipped: 0, coverage: null]
             } else {
-                parseSurefireResults()
+                processSurefireResults()
             }
         }
     }
 
-    private void parseSurefireResults() {
-        String summary = steps.sh(
-            script: "cat target/surefire-reports/*.txt 2>/dev/null | grep 'Tests run:' | tail -1 || true",
-            returnStdout: true
+    /**
+     * R80 -- reads every Surefire XML report EXACTLY ONCE and derives BOTH
+     * the aggregate suite totals and the per-testcase semantic-evidence
+     * facts from that SAME parsed structure. Replaces the previous
+     * parseSurefireResults(), which derived the aggregate from
+     * `cat target/surefire-reports/*.txt | grep 'Tests run:' | tail -1` --
+     * `tail -1` silently kept only whichever CLASS happened to sort last
+     * alphabetically, undercounting the real suite total (proven live:
+     * build #4 actually ran 17 tests across 3 classes; the old code
+     * reported 10, matching only TaskServiceTest.txt's own count). Also
+     * publishes the same XML to Jenkins' own `junit` step so a real
+     * testReport becomes available (previously never called at all, which
+     * is why /testReport/api/json 404'd).
+     */
+    private void processSurefireResults() {
+        steps.junit(testResults: 'target/surefire-reports/*.xml', allowEmptyResults: true)
+
+        List<Map> testcases = []
+        int total = 0, failures = 0, errors = 0, skipped = 0
+        boolean anyFileParsed = false
+
+        String listing = steps.sh(
+            script: 'ls target/surefire-reports/TEST-*.xml 2>/dev/null || true',
+            returnStdout: true,
         ).trim()
-        def m = (summary =~ /Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)/)
-        if (summary && m.find()) {
-            int total = m.group(1) as Integer
-            int failures = (m.group(2) as Integer) + (m.group(3) as Integer)
-            int skipped = m.group(4) as Integer
+        if (listing) {
+            for (String path : listing.split('\n')) {
+                String trimmedPath = path?.trim()
+                if (!trimmedPath) continue
+                String xml
+                try {
+                    xml = steps.readFile(trimmedPath)
+                } catch (ignored) {
+                    continue
+                }
+                def parsed
+                try {
+                    parsed = new XmlSlurper().parseText(xml)
+                } catch (ignored) {
+                    continue // malformed XML for this one file -- skip it, never fabricate a result
+                }
+                anyFileParsed = true
+                // Prefer the <testsuite> element's OWN reported attributes
+                // (what Surefire itself asserts about this file) over
+                // re-deriving them by counting <testcase> children --
+                // both should agree, but the element's own totals are the
+                // more authoritative, direct source.
+                total    += (parsed.@tests.text()    ?: '0') as Integer
+                failures += (parsed.@failures.text()  ?: '0') as Integer
+                errors   += (parsed.@errors.text()    ?: '0') as Integer
+                skipped  += (parsed.@skipped.text()   ?: '0') as Integer
+
+                parsed.testcase.each { tc ->
+                    String status = 'PASS'
+                    if (tc.failure.size() > 0) status = 'FAILURE'
+                    else if (tc.error.size() > 0) status = 'ERROR'
+                    else if (tc.skipped.size() > 0) status = 'SKIPPED'
+                    testcases << [classname: tc.@classname.text(), name: tc.@name.text(), status: status]
+                }
+            }
+        }
+
+        if (anyFileParsed) {
+            int totalFailures = failures + errors
             telemetry.tests = [
-                status  : failures > 0 ? 'FAILED' : 'SUCCESS',
-                total   : total, failures: failures, skipped: skipped, coverage: null
+                status  : totalFailures > 0 ? 'FAILED' : 'SUCCESS',
+                total   : total, failures: totalFailures, skipped: skipped, coverage: null,
             ]
         } else {
-            // Tests were supposed to run but no usable result was found: honest UNKNOWN,
-            // never a fabricated 0/PASSED.
+            // Tests were supposed to run but no usable, parseable report was found:
+            // honest UNKNOWN, never a fabricated 0/PASSED.
             telemetry.tests = [status: 'UNKNOWN', total: null, failures: null, skipped: null, coverage: null]
         }
+
+        // R80 -- bounded raw <testcase> facts for the platform's semantic
+        // evidence bridge. Never assigns meaning to a test name here --
+        // that decision belongs entirely to the backend adapter (see
+        // JUnitSemanticEvidenceAdapter), the only place a naming
+        // convention is actually parsed. Present-with-empty-list (not
+        // null) whenever at least one report was found, even with zero
+        // testcases in it -- a caller can tell "ran, found nothing" from
+        // "did not run at all".
+        telemetry.semanticTestEvidence = anyFileParsed ? [testcases: testcases] : null
     }
 }
