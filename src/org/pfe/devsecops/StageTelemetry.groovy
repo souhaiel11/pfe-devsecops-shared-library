@@ -36,6 +36,15 @@ class StageTelemetry implements Serializable {
     /** Captured directly from `git rev-parse HEAD` right after a successful checkout -- never from env.GIT_COMMIT alone (QA-BUILD-135-R1: env.GIT_COMMIT proved unreliable from this scripted-library flow). */
     String checkoutFullSha = null
     String checkoutShortSha = null
+    /**
+     * Phase 2A.9 -- captured from the SAME checkout(scm) call's own return
+     * map (scmVars?.GIT_URL) at the same point checkoutFullSha is captured.
+     * Best-effort only (unlike checkoutFullSha, nothing fails closed on
+     * this being absent) -- used solely for the OCI
+     * org.opencontainers.image.source label, which DockerRunner.build()
+     * omits entirely when this is null rather than guessing a URL.
+     */
+    String checkoutSourceUrl = null
     Map prValidation = [:]
 
     /**

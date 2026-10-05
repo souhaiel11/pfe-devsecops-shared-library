@@ -128,6 +128,10 @@ def call(Closure body = null) {
                         String capturedSha = sh(script: 'git rev-parse HEAD 2>/dev/null || true', returnStdout: true).trim()
                         telemetry.checkoutFullSha = capturedSha ?: (scmVars?.GIT_COMMIT ?: null)
                         telemetry.checkoutShortSha = telemetry.checkoutFullSha ? telemetry.checkoutFullSha.take(8) : null
+                        // Phase 2A.9 -- same reliability tier as checkoutFullSha's own
+                        // fallback (the checkout(scm) step's own return map), best-effort
+                        // only: used for the OCI source label, never fails the build.
+                        telemetry.checkoutSourceUrl = scmVars?.GIT_URL ?: null
                         if (isPR) {
                             String expected = (prValidation.expectedPrHeadSha ?: '').toString().toLowerCase()
                             if (!(expected ==~ /[a-f0-9]{40}/) || telemetry.checkoutFullSha?.toLowerCase() != expected) {
