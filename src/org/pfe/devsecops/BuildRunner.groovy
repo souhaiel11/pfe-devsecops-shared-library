@@ -39,8 +39,8 @@ class BuildRunner implements Serializable {
                 // l'agent JaCoCo garantissait qu'aucun rapport de couverture ne
                 // puisse exister, et donc que Sonar affiche 0 % pour tout
                 // projet, meme correctement configure. Constate en reel sur
-                // app-test-pfe-vermeg build #3 : « No coverage report can be
-                // found with sonar.coverage.jacoco.xmlReportPaths ».
+                // un projet reel pourtant correctement configure : « No coverage
+                // report can be found with sonar.coverage.jacoco.xmlReportPaths ».
                 //
                 // Le drapeau reste en place dans l'analyse Sonar
                 // (ScannerRunner.runSonar), ou aucun test ne tourne et ou

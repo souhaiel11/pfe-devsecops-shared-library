@@ -60,8 +60,8 @@ class ScannerRunner implements Serializable {
                     // `mvn ... 2>&1 | tee sonar-analysis.log` renvoyait le statut de
                     // `tee`, pas celui de Maven : un echec d'analyse etait donc
                     // rapporte SUCCESS a la plateforme. Constate en reel sur
-                    // app-test-pfe-vermeg build #1 -- "No plugin found for prefix
-                    // 'sonar'", et pourtant buildStageStatus.sonar == 'SUCCESS'.
+                    // un projet reel -- "No plugin found for prefix 'sonar'", et
+                    // pourtant buildStageStatus.sonar == 'SUCCESS' envoye a la plateforme.
                     // Seul `ceTaskId: null` trahissait la verite.
                     // Ni PIPESTATUS (bash) ni pipefail (extension absente des dash
                     // anciens) ne sont garantis ici : /bin/sh est dash sur cette
