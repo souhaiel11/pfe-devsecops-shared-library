@@ -244,6 +244,13 @@ class ScannerRunner implements Serializable {
 </settings>
 ODC_SETTINGS
 
+                        # R46 -- fait brut, capture inconditionnellement : « l'etape a ete
+                        # atteinte ». Distinct de « un rapport existe » et de « le scan a
+                        # reussi ». Sans ce marqueur, la plateforme ne pouvait pas
+                        # distinguer un scan propre d'un scan jamais lance.
+                        touch "$REPORT_BASE/owasp.scanExecuted"
+
+                        set +e
                         {
                           echo "=== Step 1: NVD update (API key injected via settings, never on the command line) ==="
                           timeout 20m mvn org.owasp:dependency-check-maven:$ODC_VERSION:update-only \
@@ -255,7 +262,14 @@ ODC_SETTINGS
                             -DretireJsAnalyzerEnabled=false \
                             -DnodeAuditAnalyzerEnabled=false \
                             -DossindexAnalyzerEnabled=false \
-                            -B || true
+                            -B
+                          # R46 -- statut reel de la mise a jour NVD, capture avant que
+                          # quoi que ce soit puisse l'avaler. Un `|| true` nu rendait
+                          # invisible un echec permanent : une cle d'API refusee laissait
+                          # la base de vulnerabilites figee sans que personne le sache.
+                          # On n'echoue PAS l'etape pour autant -- le scan peut encore
+                          # travailler sur le cache local -- mais le fait est rapporte.
+                          echo $? > "$REPORT_BASE/owasp.nvdUpdate.exitcode"
 
                           echo "=== Step 2: dependency scan (local cache) ==="
                           timeout 20m mvn org.owasp:dependency-check-maven:$ODC_VERSION:check \
@@ -267,8 +281,13 @@ ODC_SETTINGS
                             -DretireJsAnalyzerEnabled=false \
                             -DnodeAuditAnalyzerEnabled=false \
                             -DossindexAnalyzerEnabled=false \
-                            -B || true
+                            -B
+                          # Statut reel du goal qui applique la politique CVSS. Non nul
+                          # signifie « seuil franchi », pas « le scan n'a pas tourne » :
+                          # les deux faits restent distincts.
+                          echo $? > "$REPORT_BASE/owasp.exitcode"
                         } > "$REPORT_BASE/owasp.log" 2>&1
+                        set -e
 
                         echo "=== End of OWASP log ==="
                         tail -80 "$REPORT_BASE/owasp.log" || true

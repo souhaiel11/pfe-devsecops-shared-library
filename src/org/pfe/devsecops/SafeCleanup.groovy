@@ -27,6 +27,19 @@ class SafeCleanup implements Serializable {
     }
 
     /** Best-effort informational signal only -- never authoritative, never overrides real findings. */
+    /**
+     * R46 -- lit un petit fichier de telemetrie (un code de sortie, un
+     * marqueur). Retourne '' si le fichier n'existe pas : une absence ne doit
+     * jamais devenir une valeur. Jamais utilise pour un secret.
+     */
+    String readTextFile(String filePath) {
+        try {
+            return steps.sh(script: "cat '${filePath}' 2>/dev/null || true", returnStdout: true).trim()
+        } catch (ignored) {
+            return ''
+        }
+    }
+
     boolean grepMarker(String filePath, String pattern) {
         if (!filePath) return false
         try {

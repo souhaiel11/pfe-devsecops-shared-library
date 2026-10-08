@@ -56,6 +56,10 @@ class PlatformReporter implements Serializable {
             sonar           : args.sonar,
             docker          : args.docker,
             kubernetes      : args.kubernetes,
+            // R46 -- additif : scanExecuted / reportAvailable / toolExitStatus /
+            // policyPassed / nvdUpdateExitStatus / nvdUpdateSucceeded. Les
+            // consommateurs qui ne lisent que reports.available.owasp sont intacts.
+            owasp           : args.owasp,
             // Additive (QA-BUILD-135-R1 Defect D): factual ZAP execution diagnostics.
             // null when the ZAP stage was never entered (PR build / disabled by policy).
             // Existing consumers reading only reports.available.zap are unaffected.

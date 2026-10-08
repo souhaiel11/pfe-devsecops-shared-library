@@ -90,8 +90,11 @@ def payload = reporter.buildPayload([
 def expectedKeys = ['event', 'job', 'build_number', 'build_url', 'logs_url', 'branch', 'commit', 'status',
                      'severity_hint', 'duration_ms', 'buildStageStatus', 'technicalFailure', 'pull_request',
                      'reports', 'tests', 'sonar', 'docker', 'kubernetes', 'zap', 'commitSha', 'commitShaDiagnostic',
-                     'semanticEvidence'] as Set
-check(payload.keySet() == expectedKeys, 'TEST L - canonical payload keys match the pre-migration WF1 contract, plus additive zap/SHA/R80.1 semantic-evidence-envelope fields')
+                     'semanticEvidence', 'owasp'] as Set
+check(payload.keySet() == expectedKeys, 'TEST L - canonical payload keys match the pre-migration WF1 contract, plus additive zap/SHA/R80.1/owasp fields')
+// R46 -- `owasp` suit exactement la meme discipline additive que `zap` : absent
+// de l'appel, il vaut null et ne casse aucun consommateur existant.
+check(payload.owasp == null, 'TEST L - owasp null (additif, non transmis) ne casse aucun consommateur lisant les anciens champs')
 check(payload.logs_url == 'http://jenkins/job/pfe-app-test/134/consoleText', 'TEST L - logs_url derived correctly')
 check(payload.build_number == '134', 'TEST L - build_number forwarded (WF1 normalizes camelCase/snake_case at the boundary)')
 check(payload.zap == null, 'TEST L - zap null (additive, not passed) does not break existing consumers reading old fields')
@@ -436,7 +439,11 @@ def reportingScript = new Expando(
     env: [GIT_COMMIT: librarySha, GIT_BRANCH: 'origin/main', JOB_NAME: 'pfe-app-test', BUILD_NUMBER: '1'],
     currentBuild: [currentResult: 'SUCCESS', duration: 0],
     timeout: { Map options, Closure action -> action.call() }, echo: { Object message -> println(message) })
-def cleanupStub = new Expando(reportAvailable: { Object base, Object name -> false }, safeDeleteDir: { -> })
+// R46 -- le collaborateur a gagne readTextFile() : le stub le modelise, en
+// renvoyant '' comme le vrai le fait quand le fichier n'existe pas.
+def cleanupStub = new Expando(reportAvailable: { Object base, Object name -> false },
+                              readTextFile: { Object path -> '' },
+                              safeDeleteDir: { -> })
 Map captured = null
 def reporterStub = new Expando(buildPayload: { Map args -> shaReporter.buildPayload(args) },
     send: { Map result, Object base, Object build -> captured = result })
@@ -758,6 +765,50 @@ check(covScript.contains('[ -f "$REPORT" ] || exit 0'),
     'TEST R46-JACOCO - l\'absence de rapport sort proprement, sans faire echouer l\'etape')
 check(!covScript.contains('mvn'),
     'TEST R46-JACOCO - la lecture ne relance aucun build ni aucun plugin')
+
+// ════════════════════════════════════════════════════════════════════════
+// TEST R46-OWASP-OBS : un echec d'OWASP ne doit plus etre invisible.
+//
+// Les deux goals Maven finissaient par `|| true` : la plateforme ne pouvait
+// distinguer un scan propre d'un echec de politique CVSS, ni d'une mise a
+// jour de base refusee. Constate en reel : une cle d'API NVD invalide
+// (HTTP 404 cote NVD, identique a une cle inventee) laissait la base de
+// vulnerabilites figee sur 59 builds de 4 projets, sans aucun signal.
+// ════════════════════════════════════════════════════════════════════════
+def obsSteps = new FakeSteps()
+def obsTelemetry = new StageTelemetry()
+new ScannerRunner(obsSteps, obsTelemetry).runOwasp('/shared/reports/demo/1', false, '9.0', '.')
+String obsScript = obsSteps.shScripts.find { it.contains('dependency-check-maven') } ?: ''
+
+check(obsScript.contains('touch "$REPORT_BASE/owasp.scanExecuted"'),
+    'TEST R46-OWASP-OBS - « l\'etape a ete atteinte » est capture inconditionnellement')
+check(obsScript.contains('echo $? > "$REPORT_BASE/owasp.nvdUpdate.exitcode"'),
+    'TEST R46-OWASP-OBS - le statut de la mise a jour NVD est capture')
+check(obsScript.contains('echo $? > "$REPORT_BASE/owasp.exitcode"'),
+    'TEST R46-OWASP-OBS - le statut du goal de politique CVSS est capture')
+check(!obsScript.contains('-B || true'),
+    'TEST R46-OWASP-OBS - plus aucun « || true » nu n\'avale un statut')
+check(obsScript.contains('set +e') && obsScript.contains('set -e'),
+    'TEST R46-OWASP-OBS - un statut non nul ne tue pas l\'etape : le scan peut travailler sur le cache')
+check(obsScript.contains('> "$REPORT_BASE/owasp.log" 2>&1'),
+    'TEST R46-OWASP-OBS - la redirection du journal est conservee')
+
+// Les quatre faits atteignent la charge utile, et restent distincts.
+def obsReporter = new PlatformReporter(new FakeSteps())
+def obsPayload = obsReporter.buildPayload([
+    event: 'pipeline_success', job: 'demo', buildNumber: '1', buildUrl: 'http://j/1/',
+    branch: 'main', commit: 'abc1234', buildStatus: 'SUCCESS', severityHint: 'LOW', durationMs: 1,
+    buildStageStatus: [:], technicalFailure: null, pullRequest: null,
+    reports: [:], tests: [:], sonar: [:], docker: [:], kubernetes: [:],
+    owasp: [scanExecuted: true, reportAvailable: true, toolExitStatus: 0, policyPassed: true,
+            nvdUpdateExitStatus: 1, nvdUpdateSucceeded: false],
+])
+check(obsPayload.owasp?.nvdUpdateSucceeded == false,
+    'TEST R46-OWASP-OBS - une mise a jour de base en echec est rapportee, meme quand le scan reussit')
+check(obsPayload.owasp?.policyPassed == true && obsPayload.owasp?.scanExecuted == true,
+    'TEST R46-OWASP-OBS - « scan execute », « politique passee » et « base a jour » restent trois faits distincts')
+check(obsPayload.owasp?.toolExitStatus == 0,
+    'TEST R46-OWASP-OBS - le statut brut du goal est transporte, pas interprete')
 
 println ''
 if (failures == 0) {

@@ -334,6 +334,22 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
             boolean trivyAvailable = cleanup.reportAvailable(ctx.reportBase, 'trivy-report.json')
             boolean zapAvailable = cleanup.reportAvailable(ctx.reportBase, 'zap-report.json')
             boolean owaspAvailable = cleanup.reportAvailable(ctx.reportBase, 'dependency-check-report.json')
+            // R46 -- quatre faits distincts, qu'un simple « le fichier existe »
+            // confondait jusqu'ici :
+            //   scanExecuted        : l'etape a ete atteinte
+            //   reportAvailable     : un rapport existe
+            //   toolExitStatus      : ce que le goal de politique CVSS a renvoye
+            //   nvdUpdateExitStatus : ce que la mise a jour de la base a renvoye
+            // Le dernier rendait invisible un echec permanent : une cle d'API NVD
+            // refusee laissait la base de vulnerabilites figee sans que personne
+            // le sache. Additif : aucun consommateur existant n'est affecte.
+            boolean owaspScanExecuted = cleanup.reportAvailable(ctx.reportBase, 'owasp.scanExecuted')
+            String owaspExitRaw = cleanup.readTextFile("${ctx.reportBase}/owasp.exitcode")
+            Integer owaspToolExitStatus = (owaspExitRaw ==~ /\d+/) ? (owaspExitRaw as Integer) : null
+            Boolean owaspPolicyPassed = owaspToolExitStatus == null ? null : (owaspToolExitStatus == 0)
+            String nvdExitRaw = cleanup.readTextFile("${ctx.reportBase}/owasp.nvdUpdate.exitcode")
+            Integer nvdUpdateExitStatus = (nvdExitRaw ==~ /\d+/) ? (nvdExitRaw as Integer) : null
+            Boolean nvdUpdateSucceeded = nvdUpdateExitStatus == null ? null : (nvdUpdateExitStatus == 0)
 
             if (!ctx.checkoutFailed) {
                 telemetry.buildStageStatus['tests'] = telemetry.tests.status
@@ -416,6 +432,17 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                     build_status: telemetry.docker.build_status,
                     image_tag   : telemetry.docker.image_tag,
                     push_status : telemetry.docker.push_status
+                ],
+                // R46 -- diagnostics factuels d'OWASP, additifs a cote du drapeau
+                // reports.available.owasp que WF1 consomme deja. Jenkins enonce des
+                // faits : il ne decide ni problemClass, ni owner, ni route.
+                owasp: [
+                    scanExecuted       : owaspScanExecuted,
+                    reportAvailable    : owaspAvailable,
+                    toolExitStatus     : owaspToolExitStatus,
+                    policyPassed       : owaspPolicyPassed,
+                    nvdUpdateExitStatus: nvdUpdateExitStatus,
+                    nvdUpdateSucceeded : nvdUpdateSucceeded,
                 ],
                 kubernetes: [namespace: PlatformConfig.K8S_NAMESPACE, target: ctx.zapTargetUrl],
                 // Defect D: factual ZAP execution diagnostics, additive alongside the
