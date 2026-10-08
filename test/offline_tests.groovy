@@ -685,6 +685,37 @@ check(shellDerefs.isEmpty(),
 check(owaspScript.findAll(/\$\{env\.NVD_API_KEY\}/).size() == 2,
     'TEST R46-NVD - les deux seules mentions sont la reference Maven et son commentaire explicatif')
 
+// ════════════════════════════════════════════════════════════════════════
+// TEST R46-COVERAGE : l'etape qui lance les tests ne doit pas desactiver
+// l'agent de couverture, sinon aucun rapport ne peut exister et Sonar
+// affiche 0 % pour tout projet, meme correctement configure.
+// Constate en reel : app-test-pfe-vermeg build #3, « No coverage report
+// can be found with sonar.coverage.jacoco.xmlReportPaths ».
+// ════════════════════════════════════════════════════════════════════════
+def covSteps = new FakeSteps()
+def covTelemetry = new StageTelemetry()
+new BuildRunner(covSteps, covTelemetry).run('maven', false, null)
+String buildScript = covSteps.shScripts.find { it.contains('mvn clean package') } ?: ''
+check(buildScript.length() > 0, 'TEST R46-COVERAGE - le script de build est bien genere')
+check(!buildScript.contains('-Djacoco.skip=true'),
+    'TEST R46-COVERAGE - l\'etape Build ne desactive plus l\'agent de couverture')
+check(buildScript.contains('-DskipTests=false'),
+    'TEST R46-COVERAGE - les tests tournent toujours a cette etape')
+
+// L'analyse Sonar, elle, ne lance aucun test : le drapeau y reste legitime.
+def covSonarSteps = new FakeSteps()
+covSonarSteps.metaClass.withSonarQubeEnv = { String name, Closure body -> body.call() }
+new ScannerRunner(covSonarSteps, new StageTelemetry()).runSonar('demo-app', null, false, null, null, null, null)
+String covSonarScript = covSonarSteps.shScripts.find { it.contains('sonar:sonar') } ?: ''
+check(covSonarScript.contains('-Djacoco.skip=true'),
+    'TEST R46-COVERAGE - l\'analyse Sonar garde le drapeau : aucun test n\'y tourne')
+
+// Un projet qui ne declare pas le plugin n'est pas affecte : le drapeau retire
+// n'etait lu par personne chez lui. On verifie qu'aucune option de couverture
+// n'est imposee au projet par la bibliotheque.
+check(!buildScript.contains('jacoco') && !buildScript.contains('coverage'),
+    'TEST R46-COVERAGE - la bibliotheque n\'impose aucune configuration de couverture au projet')
+
 println ''
 if (failures == 0) {
     println 'ALL OFFLINE TESTS PASSED'

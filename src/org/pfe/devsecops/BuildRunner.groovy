@@ -33,9 +33,26 @@ class BuildRunner implements Serializable {
         telemetry.buildStageStatus['build'] = 'FAILED'
         steps.dir(workingDirectory ?: '.') {
             steps.catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                // R46 -- `-Djacoco.skip=true` est retire de CETTE etape.
+                //
+                // C'est la seule etape ou les tests tournent : y desactiver
+                // l'agent JaCoCo garantissait qu'aucun rapport de couverture ne
+                // puisse exister, et donc que Sonar affiche 0 % pour tout
+                // projet, meme correctement configure. Constate en reel sur
+                // app-test-pfe-vermeg build #3 : « No coverage report can be
+                // found with sonar.coverage.jacoco.xmlReportPaths ».
+                //
+                // Le drapeau reste en place dans l'analyse Sonar
+                // (ScannerRunner.runSonar), ou aucun test ne tourne et ou
+                // l'agent n'aurait rien a mesurer.
+                //
+                // Generique et sans effet de bord : un projet qui ne declare
+                // pas jacoco-maven-plugin ne voit aucun changement -- la
+                // propriete n'est alors lue par personne. Un projet qui le
+                // declare obtient enfin une couverture reelle.
                 steps.sh """
                     set -e
-                    mvn clean package -B -DskipTests=${skipTests} -Djacoco.skip=true
+                    mvn clean package -B -DskipTests=${skipTests}
                 """
                 telemetry.buildStageStatus['build'] = 'SUCCESS'
             }
