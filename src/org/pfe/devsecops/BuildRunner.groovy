@@ -133,7 +133,8 @@ class BuildRunner implements Serializable {
             int totalFailures = failures + errors
             telemetry.tests = [
                 status  : totalFailures > 0 ? 'FAILED' : 'SUCCESS',
-                total   : total, failures: totalFailures, skipped: skipped, coverage: null,
+                total   : total, failures: totalFailures, skipped: skipped,
+                coverage: readLineCoverage(),
             ]
         } else {
             // Tests were supposed to run but no usable, parseable report was found:
@@ -151,4 +152,45 @@ class BuildRunner implements Serializable {
         // "did not run at all".
         telemetry.semanticTestEvidence = anyFileParsed ? [testcases: testcases] : null
     }
+    /**
+     * R46 -- couverture de lignes REELLE, lue dans le rapport JaCoCo produit par
+     * le build, ou `null` si aucun rapport n'existe.
+     *
+     * `tests.coverage` etait jusqu'ici TOUJOURS `null` : aucune couverture ne
+     * remontait donc jamais a la plateforme, quel que soit le projet. Et le bloc
+     * Sonar de WF1 lit sa couverture sur la reponse de l'API /issues, qui ne
+     * porte pas ce champ -- la couverture affichee valait donc 0 par
+     * construction, pour tout le monde.
+     *
+     * Choix assumes :
+     *  - on lit le rapport XML de JaCoCo, artefact autoritaire produit par le
+     *    build lui-meme, jamais une estimation ;
+     *  - aucun rapport -> `null`, jamais 0 : « non mesure » et « rien de
+     *    couvert » ne sont pas la meme information ;
+     *  - le dernier compteur LINE du fichier est l'agregat global du rapport ;
+     *  - aucune configuration n'est imposee au projet : un projet qui ne produit
+     *    pas de rapport continue de renvoyer `null`, exactement comme avant.
+     */
+    private Integer readLineCoverage() {
+        String raw = steps.sh(
+            script: '''
+                set -e
+                REPORT=target/site/jacoco/jacoco.xml
+                [ -f "$REPORT" ] || exit 0
+                grep -o '<counter type="LINE" missed="[0-9]*" covered="[0-9]*"/>' "$REPORT" \\
+                  | tail -1 \\
+                  | sed -E 's/.*missed="([0-9]+)" covered="([0-9]+)".*/\\1 \\2/'
+            ''',
+            returnStdout: true
+        ).trim()
+        if (!raw) return null
+        def parts = raw.trim().tokenize(' \t')
+        if (parts.size() != 2) return null
+        int missed, covered
+        try { missed = parts[0] as Integer; covered = parts[1] as Integer } catch (ignored) { return null }
+        int lines = missed + covered
+        if (lines <= 0) return null
+        return Math.round((covered * 100.0d) / lines) as Integer
+    }
+
 }

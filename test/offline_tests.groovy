@@ -716,6 +716,49 @@ check(covSonarScript.contains('-Djacoco.skip=true'),
 check(!buildScript.contains('jacoco') && !buildScript.contains('coverage'),
     'TEST R46-COVERAGE - la bibliotheque n\'impose aucune configuration de couverture au projet')
 
+// ════════════════════════════════════════════════════════════════════════
+// TEST R46-JACOCO : la couverture remontee doit etre la couverture MESUREE,
+// et une absence de mesure doit rester une absence -- jamais 0.
+// Regression visee : tests.coverage valait TOUJOURS null, donc aucune
+// couverture n'atteignait jamais la plateforme, quel que soit le projet.
+// ════════════════════════════════════════════════════════════════════════
+// Lecture directe : la methode est privee en Groovy mais appelable par nom.
+def covSteps2 = new FakeSteps()
+covSteps2.stdoutDecider = { String script -> script.contains('jacoco.xml') ? '8 97' : null }
+def covRunner = new BuildRunner(covSteps2, new StageTelemetry())
+check(covRunner.readLineCoverage() == 92,
+    "TEST R46-JACOCO - 97 couvertes sur 105 lignes donne 92 % (obtenu ${covRunner.readLineCoverage()})")
+
+def noReportSteps = new FakeSteps()
+noReportSteps.stdoutDecider = { String script -> script.contains('jacoco.xml') ? '' : null }
+check(new BuildRunner(noReportSteps, new StageTelemetry()).readLineCoverage() == null,
+    'TEST R46-JACOCO - aucun rapport donne null, jamais 0')
+
+def malformedSteps = new FakeSteps()
+malformedSteps.stdoutDecider = { String script -> script.contains('jacoco.xml') ? 'pas-un-nombre' : null }
+check(new BuildRunner(malformedSteps, new StageTelemetry()).readLineCoverage() == null,
+    'TEST R46-JACOCO - une sortie illisible donne null, jamais une valeur devinee')
+
+def emptyProjectSteps = new FakeSteps()
+emptyProjectSteps.stdoutDecider = { String script -> script.contains('jacoco.xml') ? '0 0' : null }
+check(new BuildRunner(emptyProjectSteps, new StageTelemetry()).readLineCoverage() == null,
+    'TEST R46-JACOCO - zero ligne analysable donne null, jamais 0 %')
+
+def zeroCoveredSteps = new FakeSteps()
+zeroCoveredSteps.stdoutDecider = { String script -> script.contains('jacoco.xml') ? '105 0' : null }
+check(new BuildRunner(zeroCoveredSteps, new StageTelemetry()).readLineCoverage() == 0,
+    'TEST R46-JACOCO - une couverture reellement nulle vaut bien 0, et se distingue de null')
+
+// Le script de lecture ne doit jamais imposer de configuration au projet.
+def scriptSteps = new FakeSteps()
+scriptSteps.stdoutDecider = { String script -> script.contains('jacoco.xml') ? '0 10' : null }
+new BuildRunner(scriptSteps, new StageTelemetry()).readLineCoverage()
+String covScript = scriptSteps.shScripts.find { it.contains('jacoco.xml') } ?: ''
+check(covScript.contains('[ -f "$REPORT" ] || exit 0'),
+    'TEST R46-JACOCO - l\'absence de rapport sort proprement, sans faire echouer l\'etape')
+check(!covScript.contains('mvn'),
+    'TEST R46-JACOCO - la lecture ne relance aucun build ni aucun plugin')
+
 println ''
 if (failures == 0) {
     println 'ALL OFFLINE TESTS PASSED'
