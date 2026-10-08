@@ -31,3 +31,9 @@ java -cp "$GROOVY_JAR:$OUT" org.codehaus.groovy.tools.FileSystemCompiler -d "$OU
 
 echo "== Running executable offline tests =="
 LIB_ROOT="$LIB_ROOT" java -cp "$GROOVY_JAR:$OUT" offline_tests
+
+# Le harnais Groovy verifie le CONTRAT des scripts generes. Celui-ci verifie
+# leur COMPORTEMENT dans le meme shell que Jenkins -- propagation du statut et
+# non-exposition du secret -- ce qu'aucune assertion de texte ne peut prouver.
+echo "== Running shell behaviour tests (status propagation, secret exposure) =="
+bash "$HERE/shell_status_tests.sh"

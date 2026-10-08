@@ -56,8 +56,22 @@ class ScannerRunner implements Serializable {
                     } else {
                         steps.echo 'SonarQube: standard branch mode'
                     }
+                    // R46 -- le statut de l'etape doit etre celui de MAVEN.
+                    // `mvn ... 2>&1 | tee sonar-analysis.log` renvoyait le statut de
+                    // `tee`, pas celui de Maven : un echec d'analyse etait donc
+                    // rapporte SUCCESS a la plateforme. Constate en reel sur
+                    // app-test-pfe-vermeg build #1 -- "No plugin found for prefix
+                    // 'sonar'", et pourtant buildStageStatus.sonar == 'SUCCESS'.
+                    // Seul `ceTaskId: null` trahissait la verite.
+                    // Ni PIPESTATUS (bash) ni pipefail (extension absente des dash
+                    // anciens) ne sont garantis ici : /bin/sh est dash sur cette
+                    // image. On redirige, on capture le statut, on reaffiche le
+                    // journal -- portable, et le statut reste vrai.
+                    // sonar-analysis.log reste produit : l'extraction du ceTaskId,
+                    // plus bas, en depend.
                     steps.sh """
                         set -e
+                        set +e
                         mvn sonar:sonar -B \
                           -DskipTests=true \
                           -Djacoco.skip=true \
@@ -65,7 +79,14 @@ class ScannerRunner implements Serializable {
                           -Dsonar.projectName="${projectKey}" \
                           -Dsonar.host.url="${PlatformConfig.SONAR_HOST_URL}" \
                           -Dsonar.token="\$SONAR_TOKEN" \
-                          ${prArgs} 2>&1 | tee sonar-analysis.log
+                          ${prArgs} > sonar-analysis.log 2>&1
+                        SONAR_STATUS=\$?
+                        set -e
+                        cat sonar-analysis.log
+                        if [ "\$SONAR_STATUS" -ne 0 ]; then
+                          echo "SONAR_ANALYSIS_FAILED exit=\$SONAR_STATUS"
+                          exit "\$SONAR_STATUS"
+                        fi
                     """
                 }
                 telemetry.buildStageStatus['sonar'] = 'SUCCESS'
@@ -193,11 +214,41 @@ class ScannerRunner implements Serializable {
                         set -e
                         mkdir -p "$REPORT_BASE" "$ODC_DATA"
 
+                        # R46 / P0 -- le secret ne doit JAMAIS atteindre un fichier.
+                        # Jenkins execute ce script via `sh -xe` : xtrace ecrit chaque
+                        # commande DEVELOPPEE sur stderr. Le bloc ci-dessous redirige
+                        # stderr vers owasp.log, et le masquage de credentials de
+                        # Jenkins ne filtre que le flux de console qu'il recoit --
+                        # jamais des octets que le shell ecrit droit dans un fichier.
+                        # Resultat constate : la cle NVD en clair dans owasp.log, pour
+                        # tous les projets, alors que la console affichait bien
+                        # `-Dsonar.token=****`.
+                        #
+                        # Correctif : la cle n'est plus un ARGUMENT. Le settings.xml
+                        # genere ici ne contient qu'une REFERENCE (${env.NVD_API_KEY}),
+                        # que Maven interpole a l'execution. Rien de secret dans la
+                        # ligne de commande, donc rien dans la trace, rien dans le
+                        # fichier, et rien dans `ps`.
+                        SETTINGS_NVD="$REPORT_BASE/.odc-settings.xml"
+                        cat > "$SETTINGS_NVD" <<'ODC_SETTINGS'
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+  <profiles>
+    <profile>
+      <id>nvd-api-key-from-environment</id>
+      <activation><activeByDefault>true</activeByDefault></activation>
+      <properties>
+        <nvdApiKey>${env.NVD_API_KEY}</nvdApiKey>
+      </properties>
+    </profile>
+  </profiles>
+</settings>
+ODC_SETTINGS
+
                         {
-                          echo "=== Step 1: NVD update (with API key) ==="
+                          echo "=== Step 1: NVD update (API key injected via settings, never on the command line) ==="
                           timeout 20m mvn org.owasp:dependency-check-maven:$ODC_VERSION:update-only \
+                            -s "$SETTINGS_NVD" \
                             -DdataDirectory="$ODC_DATA" \
-                            -DnvdApiKey="$NVD_API_KEY" \
                             -DnvdApiDelay=2000 \
                             -DnvdMaxRetryCount=15 \
                             -DnvdValidForHours=168 \
@@ -229,6 +280,8 @@ class ScannerRunner implements Serializable {
                         fi
                         [ -f target/dependency-check-report.html ] && cp target/dependency-check-report.html "$REPORT_BASE/" || true
                         [ -f target/dependency-check-report.xml ]  && cp target/dependency-check-report.xml  "$REPORT_BASE/" || true
+
+                        rm -f "$SETTINGS_NVD"
 
                         echo "=== Final OWASP reports ==="
                         ls -lh "$REPORT_BASE"/dependency-check-report.* || true

@@ -621,6 +621,70 @@ check(r80E2eTestcases?.size() == 4, 'R80.1 E2E - all 4 real grammar-compliant te
 check(r80E2eTestcases?.every { it.name?.startsWith('semantic_v1__DEFAULT_VALUE_SEMANTICS_DEFECT__') && it.status == 'PASS' },
     'R80.1 E2E - every grammar-compliant testcase is carried through with its real PASS status, unmodified, exactly as the backend JUnitSemanticEvidenceAdapter grammar parser expects')
 
+// ════════════════════════════════════════════════════════════════════════
+// TEST R46-SONAR : le statut de l'etape Sonar doit etre celui de Maven.
+//
+// Regression visee : `mvn sonar:sonar ... | tee log` renvoyait le statut de
+// `tee`. Un echec d'analyse etait rapporte SUCCESS a la plateforme. On
+// verifie ici le CONTRAT du script genere ; la propagation reelle du statut
+// est verifiee par test/shell_status_tests.sh, dans un vrai /bin/sh.
+// ════════════════════════════════════════════════════════════════════════
+def sonarSteps = new FakeSteps()
+// withSonarQubeEnv n'existe pas dans FakeSteps : on l'ajoute par metaClasse,
+// comme Jenkins le resout dynamiquement a l'execution.
+sonarSteps.metaClass.withSonarQubeEnv = { String name, Closure body -> body.call() }
+def sonarTelemetry = new StageTelemetry()
+new ScannerRunner(sonarSteps, sonarTelemetry).runSonar('demo-app', null, false, null, null, null, null)
+String sonarScript = sonarSteps.shScripts.find { it.contains('sonar:sonar') } ?: ''
+
+check(sonarScript.length() > 0, 'TEST R46-SONAR - le script d\'analyse Sonar est bien genere')
+check(!(sonarScript =~ /sonar:sonar[\s\S]*?\|\s*tee/),
+    'TEST R46-SONAR - plus de tube vers tee : le statut de Maven n\'est plus masque')
+check(sonarScript.contains('SONAR_STATUS=$?'),
+    'TEST R46-SONAR - le statut de Maven est capture explicitement')
+check(sonarScript.contains('exit "$SONAR_STATUS"'),
+    'TEST R46-SONAR - un statut non nul fait echouer l\'etape')
+check(sonarScript.contains('> sonar-analysis.log 2>&1') && sonarScript.contains('cat sonar-analysis.log'),
+    'TEST R46-SONAR - le journal reste produit (extraction du ceTaskId) et reaffiche')
+check(!sonarScript.contains('PIPESTATUS') && !sonarScript.contains('pipefail'),
+    'TEST R46-SONAR - aucune dependance a une extension de shell (dash n\'a ni l\'un ni l\'autre)')
+
+// ════════════════════════════════════════════════════════════════════════
+// TEST R46-NVD : la cle API NVD ne doit jamais atteindre un fichier.
+//
+// Regression visee (P0) : Jenkins execute `sh -xe`, xtrace ecrit la commande
+// DEVELOPPEE sur stderr, et l'etape OWASP redirige stderr vers owasp.log --
+// un fichier que le masquage de credentials de Jenkins ne voit jamais.
+// ════════════════════════════════════════════════════════════════════════
+def owaspSteps = new FakeSteps()
+def owaspTelemetry = new StageTelemetry()
+new ScannerRunner(owaspSteps, owaspTelemetry).runOwasp('/shared/reports/demo/1', false, '9.0', '.')
+String owaspScript = owaspSteps.shScripts.find { it.contains('dependency-check-maven') } ?: ''
+
+check(owaspScript.length() > 0, 'TEST R46-NVD - le script OWASP est bien genere')
+check(!owaspScript.contains('-DnvdApiKey='),
+    'TEST R46-NVD - la cle n\'est plus passee en argument de ligne de commande')
+check(owaspScript.contains('-s "$SETTINGS_NVD"'),
+    'TEST R46-NVD - la cle est injectee via un fichier de settings Maven')
+check(owaspScript.contains('<nvdApiKey>${env.NVD_API_KEY}</nvdApiKey>'),
+    'TEST R46-NVD - le settings ne contient qu\'une REFERENCE, jamais la valeur')
+check(owaspScript.contains('rm -f "$SETTINGS_NVD"'),
+    'TEST R46-NVD - le fichier de settings est retire du repertoire de rapports')
+check(owaspScript.contains('> "$REPORT_BASE/owasp.log" 2>&1'),
+    'TEST R46-NVD - la redirection du journal est conservee (comportement inchange)')
+check(owaspScript.contains('update-only') && owaspScript.contains('-DautoUpdate=false'),
+    'TEST R46-NVD - les deux etapes OWASP sont preservees : mise a jour puis scan hors ligne')
+
+// La propriete qui compte n'est pas le nombre de mentions, mais l'absence de
+// toute DEREFERENCE shell du secret : c'est `$NVD_API_KEY` que xtrace
+// developperait. `${env.NVD_API_KEY}` est une reference Maven, resolue par
+// Maven, jamais par le shell -- et elle vit dans un heredoc quote.
+def shellDerefs = owaspScript.findAll(/(?<!\{env\.)\$\{?NVD_API_KEY\}?/)
+check(shellDerefs.isEmpty(),
+    "TEST R46-NVD - aucune dereference shell du secret, donc rien a developper pour xtrace (trouve ${shellDerefs})")
+check(owaspScript.findAll(/\$\{env\.NVD_API_KEY\}/).size() == 2,
+    'TEST R46-NVD - les deux seules mentions sont la reference Maven et son commentaire explicatif')
+
 println ''
 if (failures == 0) {
     println 'ALL OFFLINE TESTS PASSED'
