@@ -780,8 +780,13 @@ def obsTelemetry = new StageTelemetry()
 new ScannerRunner(obsSteps, obsTelemetry).runOwasp('/shared/reports/demo/1', false, '9.0', '.')
 String obsScript = obsSteps.shScripts.find { it.contains('dependency-check-maven') } ?: ''
 
-check(obsScript.contains('touch "$REPORT_BASE/owasp.scanExecuted"'),
+check(obsScript.contains('echo executed > "$REPORT_BASE/owasp.scanExecuted"'),
     'TEST R46-OWASP-OBS - « l\'etape a ete atteinte » est capture inconditionnellement')
+// reportAvailable() teste `test -s` : un marqueur VIDE serait lu comme absent,
+// et rapporterait faux un fait vrai. Constate en reel sur un build : le fichier
+// existait, et scanExecuted valait quand meme false.
+check(!obsScript.contains('touch "$REPORT_BASE/owasp.scanExecuted"'),
+    'TEST R46-OWASP-OBS - le marqueur n\'est jamais cree vide')
 check(obsScript.contains('echo $? > "$REPORT_BASE/owasp.nvdUpdate.exitcode"'),
     'TEST R46-OWASP-OBS - le statut de la mise a jour NVD est capture')
 check(obsScript.contains('echo $? > "$REPORT_BASE/owasp.exitcode"'),

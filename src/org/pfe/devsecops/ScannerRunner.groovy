@@ -248,7 +248,12 @@ ODC_SETTINGS
                         # atteinte ». Distinct de « un rapport existe » et de « le scan a
                         # reussi ». Sans ce marqueur, la plateforme ne pouvait pas
                         # distinguer un scan propre d'un scan jamais lance.
-                        touch "$REPORT_BASE/owasp.scanExecuted"
+                        # Le marqueur porte un CONTENU, pas seulement un nom :
+                        # reportAvailable() teste `test -s` (fichier non vide), donc un
+                        # `touch` de taille nulle aurait rapporte scanExecuted=false
+                        # alors que l'etape venait de s'executer. Rapporter faux un fait
+                        # vrai est exactement le defaut qu'on corrige ici.
+                        echo executed > "$REPORT_BASE/owasp.scanExecuted"
 
                         set +e
                         {
