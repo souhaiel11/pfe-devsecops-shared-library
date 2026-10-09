@@ -68,15 +68,10 @@ class PlatformConfig implements Serializable {
     static final int TIMEOUT_ZAP_MINUTES = 40
     static final int TIMEOUT_POST_REPORT_MINUTES = 2
 
-    // R58 — l'enregistrement de provenance a sa PROPRE fenetre, distincte de
-    // celle du rapport. Le backend ne peut correler le build qu'une fois que
-    // WF1 a persiste sourceCommitSha sur l'incident issu de ce meme rapport :
-    // au build #10 cela a pris 104 s APRES l'envoi du rapport, alors que la
-    // fenetre de rapport entiere ne fait que 120 s. Aucun budget de reprise
-    // utile ne tenait dedans.
-    static final int TIMEOUT_PROVENANCE_MINUTES  = 5
-    static final int PROVENANCE_ATTEMPTS         = 12
-    static final int PROVENANCE_WAIT_SECONDS     = 20   // 12 x 20 s = 240 s < 5 min
+    // R59 — les constantes de fenetre/reprise de provenance ont ete supprimees
+    // avec l'ecrivain Jenkins. Il n'y a plus de delai a dimensionner : la
+    // plateforme enregistre la provenance quand l'identite de build est
+    // persistee, pas apres une attente devinee.
 
     static final String OWASP_DC_VERSION = '12.2.2'
     static final String OWASP_DC_DATA_DIR = '/var/jenkins_home/dependency-check-data-v12'
