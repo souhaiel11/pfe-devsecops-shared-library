@@ -406,6 +406,93 @@ check(!(pipe =~ /Map imagePublication\s*=/),
 check(!(pipe =~ /\n\s+imagePublication\s*=\s*acrPublisher/),
   'PIPELINE — plus aucune affectation de locale depuis la closure withCredentials')
 
+// ════════════════════════════════════════════════════════════════════════════
+// 9. R57 — INVARIANT : CHAINE D'ARTEFACT REQUISE != TELEMETRIE NON BLOQUANTE
+//
+// Une provPublication d'image reussie dont la provenance echoue VRAIMENT ne doit
+// pas laisser le build en SUCCESS. L'echec de reporting, lui, reste
+// deliberement non bloquant. Les deux chemins doivent rester distincts.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── a. anti-regression de PORTEE (la classe de bug du build #9) ───────────
+// reportToPlatform est une METHODE distincte de call() : elle ne capture
+// aucune locale de call(). Tout collaborateur doit donc etre un PARAMETRE.
+def sigMatch = (pipe =~ /def reportToPlatform\(([^)]*)\)/)
+check(sigMatch.find(), 'PORTEE — la signature de reportToPlatform est analysable')
+String reportParams = sigMatch.group(1)
+check(reportParams.contains('acrPublisher'),
+  'PORTEE — acrPublisher est un PARAMETRE de reportToPlatform, pas une locale de call()')
+check((pipe =~ /reportToPlatform\(this,\s*telemetry,\s*cleanup,\s*reporter,\s*acrPublisher,/).find(),
+  'PORTEE — le site d\'appel transmet effectivement acrPublisher')
+
+// Toute locale de call() utilisee dans reportToPlatform sans etre passee
+// reproduirait le defaut du build #9. On verifie les collaborateurs connus.
+int reportStart = pipe.indexOf('def reportToPlatform(')
+String reportBody = pipe.substring(reportStart)
+['acrPublisher', 'telemetry', 'cleanup', 'reporter'].each { collaborator ->
+    if (reportBody =~ /(?<![\w.])${collaborator}\./) {
+        check(reportParams.contains(collaborator),
+          "PORTEE — ${collaborator}, utilise dans reportToPlatform, y est bien un parametre")
+    }
+}
+
+// ── b. l'etape de provenance a son PROPRE catch ───────────────────────────
+def stageMatch = (pipe =~ /(?s)stage\('Record Image Provenance'\)\s*\{(.*?)\n            \}/)
+check(stageMatch.find(), 'INVARIANT — le bloc de l\'etape de provenance est analysable')
+String provenanceStage = stageMatch.group(1)
+check(provenanceStage.contains('try {') && (provenanceStage =~ /catch\s*\(/).find(),
+  'INVARIANT — la provenance ne delegue plus son echec au catch de reporting')
+check((provenanceStage =~ /currentBuild\.result\s*=\s*'FAILURE'/).find(),
+  'INVARIANT — un echec de provenance marque le build en FAILURE')
+
+// ── c. le catch de reporting reste, lui, non bloquant ─────────────────────
+// Deux chemins distincts : l'artefact bloque, la telemetrie non. On isole le
+// catch de reporting (apres l'etape) pour ne pas confondre les deux.
+int stageEnd = pipe.indexOf(stageMatch.group(0)) + stageMatch.group(0).length()
+String afterStage = pipe.substring(stageEnd)
+def reportCatch = (afterStage =~ /(?s)\}\s*catch\s*\(ex\)\s*\{(.*?)\n        \}/)
+check(reportCatch.find(), 'INVARIANT — le catch de reporting est analysable')
+check(!(reportCatch.group(1) =~ /currentBuild\.result\s*=/),
+  'INVARIANT — un echec de REPORTING ne touche toujours pas le resultat du build')
+
+// ── d. composition : provenance KO => push SUCCESS + FAILED + FAILURE ─────
+// On rejoue la composition exacte de l'etape (recordProvenance dans un try
+// dont le catch marque le build), avec un enregistrement qui echoue vraiment.
+def provFailBuild = [result: null]
+def provFailSteps = stepsWith([:], [SECRET_ID])   // secret interne indisponible
+def telInv = new StageTelemetry()
+telInv.docker.build_status = 'SUCCESS'
+telInv.docker.push_status  = 'SUCCESS'
+telInv.docker.published_tag = '10-a1b2c3d4e5f6'
+def provPublication = [published: true, target: t, tag: '10-a1b2c3d4e5f6',
+                   commitSha: SHA, buildNumber: '10']
+try {
+    new AcrPublisher(provFailSteps, telInv).recordProvenance(provPublication, 2, 1)
+} catch (provenanceError) {
+    provFailBuild.result = 'FAILURE'
+}
+check(telInv.docker.push_status == 'SUCCESS',
+  'COMPOSITION — push SUCCESS : le fait historique survit a l\'echec de provenance')
+check(telInv.docker.provenance_status == 'FAILED',
+  'COMPOSITION — provenance_status = FAILED')
+check(provFailBuild.result == 'FAILURE',
+  'COMPOSITION — la chaine de publication REQUISE fait echouer le build')
+check(telInv.docker.published_tag == '10-a1b2c3d4e5f6',
+  'COMPOSITION — les coordonnees publiees restent vraies')
+
+// Et le cas miroir : provenance OK => le build n'est pas marque.
+def provOkBuild = [result: null]
+def provOkSteps = stepsWith([:], [])
+def telProvOk = new StageTelemetry()
+telProvOk.docker.push_status = 'SUCCESS'
+try {
+    new AcrPublisher(provOkSteps, telProvOk).recordProvenance(provPublication, 2, 1)
+} catch (provenanceError) {
+    provOkBuild.result = 'FAILURE'
+}
+check(provOkBuild.result == null,
+  'COMPOSITION — provenance OK : le build n\'est pas marque en echec')
+
 println ''
 if (failures > 0) {
     println "ACR PUBLISHER TESTS: ${failures} echec(s)"

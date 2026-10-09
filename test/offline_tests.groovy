@@ -448,8 +448,17 @@ Map captured = null
 def reporterStub = new Expando(buildPayload: { Map args -> shaReporter.buildPayload(args) },
     send: { Map result, Object base, Object build -> captured = result })
 def pipelineScript = this.class.classLoader.loadClass('devSecOpsPipeline').newInstance()
+// R57 -- acrPublisher est desormais un PARAMETRE de reportToPlatform (cf. la
+// classe de bug du build #9 : une methode ne capture pas les locales de call()).
+boolean provenanceAttempted = false
+def acrPublisherStub = new Expando(recordProvenance: { Object pub, Object a, Object w ->
+    provenanceAttempted = true
+})
 pipelineScript.reportToPlatform(reportingScript, appTelemetry, cleanupStub, reporterStub,
+    acrPublisherStub,
     [isPR: false, checkoutFailed: false, zapStageEntered: false, applicationName: 'pfe-app-test'])
+check(!provenanceAttempted,
+    'R57 - rien n\'a ete publie : aucune provenance n\'est tentee')
 check(captured?.commitSha == applicationSha && captured?.commit == applicationSha.take(8),
     'SHA - real reportToPlatform forwards application telemetry despite different environment SHA')
 String producerSource = new File(System.getenv('LIB_ROOT'), 'vars/devSecOpsPipeline.groovy').text
@@ -458,6 +467,75 @@ check(producerSource.contains('def scmVars = checkout(scm)')
     && producerSource.contains('telemetry.checkoutFullSha = capturedSha ?: (scmVars?.GIT_COMMIT ?: null)')
     && producerSource.contains('checkoutSha     : telemetry.checkoutFullSha'),
     'SHA - capture and forwarding remain tied to application checkout')
+
+// ---- R57: INVARIANT -- publication REQUISE dont la provenance echoue -------
+// On execute le VRAI reportToPlatform. L'image est publiee, l'enregistrement
+// de provenance echoue pour de bon : le build doit finir en FAILURE, sans que
+// le catch de reporting (volontairement non bloquant) ne l'absorbe.
+def invTelemetry = new StageTelemetry()
+invTelemetry.checkoutFullSha = applicationSha
+invTelemetry.checkoutShortSha = applicationSha.take(8)
+invTelemetry.docker.build_status = 'SUCCESS'
+invTelemetry.docker.push_status  = 'SUCCESS'
+invTelemetry.docker.published_tag = '10-' + applicationSha.take(12)
+invTelemetry.imagePublication = [published: true, tag: '10-' + applicationSha.take(12)]
+
+def invBuild = [currentResult: 'SUCCESS', duration: 0]
+def invEchoes = []
+def invScript = new Expando(
+    env: [GIT_COMMIT: librarySha, GIT_BRANCH: 'origin/main', JOB_NAME: 'pfe-app-test', BUILD_NUMBER: '10'],
+    currentBuild: invBuild,
+    timeout: { Map options, Closure action -> action.call() },
+    echo: { Object message -> invEchoes << String.valueOf(message) })
+
+def invPipeline = this.class.classLoader.loadClass('devSecOpsPipeline').newInstance()
+// `stage` se resout sur l'instance de script dans Jenkins ; hors-ligne on le stub.
+boolean invStageEntered = false
+invPipeline.metaClass.stage = { Object name, Closure action ->
+    if (name == 'Record Image Provenance') { invStageEntered = true }
+    action.call()
+}
+def failingAcrPublisher = new Expando(recordProvenance: { Object pub, Object a, Object w ->
+    // ce que fait le vrai AcrPublisher : il pose le fait, puis echoue
+    invTelemetry.docker.provenance_status = 'FAILED'
+    throw new RuntimeException('ACR_PROVENANCE_REGISTRATION_FAILED: registration refused')
+})
+invPipeline.reportToPlatform(invScript, invTelemetry, cleanupStub, reporterStub,
+    failingAcrPublisher,
+    [isPR: false, checkoutFailed: false, zapStageEntered: false, applicationName: 'pfe-app-test'])
+
+check(invStageEntered, 'R57 - l\'etape Record Image Provenance a bien ete executee')
+check(invBuild.result == 'FAILURE',
+    'R57 - INVARIANT : provenance requise en echec => le build est FAILURE, pas SUCCESS')
+check(invTelemetry.docker.push_status == 'SUCCESS',
+    'R57 - le fait historique push_status = SUCCESS n\'est pas reecrit')
+check(invTelemetry.docker.provenance_status == 'FAILED',
+    'R57 - provenance_status = FAILED : deux faits distincts')
+check(invEchoes.any { it.contains('REQUIRED ARTIFACT CHAIN FAILED') },
+    'R57 - l\'echec est annonce comme un echec d\'artefact, pas comme un echec de reporting')
+check(!invEchoes.any { it.contains('Reporting failed (non-fatal') },
+    'R57 - l\'echec de provenance ne passe PAS par le catch non bloquant du reporting')
+
+// Cas miroir : provenance OK => le build n'est pas marque en echec.
+def okBuild2 = [currentResult: 'SUCCESS', duration: 0]
+def okScript2 = new Expando(
+    env: [GIT_COMMIT: librarySha, GIT_BRANCH: 'origin/main', JOB_NAME: 'pfe-app-test', BUILD_NUMBER: '11'],
+    currentBuild: okBuild2,
+    timeout: { Map options, Closure action -> action.call() }, echo: { Object message -> })
+def okTelemetry = new StageTelemetry()
+okTelemetry.checkoutFullSha = applicationSha
+okTelemetry.docker.push_status = 'SUCCESS'
+okTelemetry.imagePublication = [published: true, tag: '11-' + applicationSha.take(12)]
+def okPipeline = this.class.classLoader.loadClass('devSecOpsPipeline').newInstance()
+okPipeline.metaClass.stage = { Object name, Closure action -> action.call() }
+okPipeline.reportToPlatform(okScript2, okTelemetry, cleanupStub, reporterStub,
+    new Expando(recordProvenance: { Object pub, Object a, Object w ->
+        okTelemetry.docker.provenance_status = 'SUCCESS' }),
+    [isPR: false, checkoutFailed: false, zapStageEntered: false, applicationName: 'pfe-app-test'])
+check(okBuild2.result == null,
+    'R57 - provenance OK : le resultat du build reste intact')
+check(okTelemetry.docker.provenance_status == 'SUCCESS',
+    'R57 - provenance OK : provenance_status = SUCCESS')
 
 // ---- R80: publishSemanticTestEvidence() -- structured JUnit publication + raw testcase extraction ----
 def r80Steps = new FakeSteps()

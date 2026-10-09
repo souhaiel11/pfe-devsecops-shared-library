@@ -275,7 +275,7 @@ def call(Closure body = null) {
                 // N8N_API_KEY must stay bound through the platform callback below, on
                 // every path including a checkout failure -- WF1 must be notified of a
                 // pre-stage failure too, not just of completed runs.
-                reportToPlatform(this, telemetry, cleanup, reporter, [
+                reportToPlatform(this, telemetry, cleanup, reporter, acrPublisher, [
                     applicationName: applicationName, imageName: imageName, imageTag: imageTag,
                     isPR: isPR, reportBase: reportBase, n8nReportBase: n8nReportBase,
                     checkoutFailed: checkoutFailed, stageFailure: stageFailure, zapTargetUrl: zapTargetUrl, zapStageEntered: zapStageEntered,
@@ -320,7 +320,12 @@ def applicationServiceName(String zapTargetUrl) {
  * around (Section 13). Any failure here is swallowed and logged: it must
  * never mask the pipeline's real result (Section 14).
  */
-def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
+// R57 — acrPublisher est passe EXPLICITEMENT : reportToPlatform est une
+// methode distincte de call(), elle ne capture donc aucune de ses locales.
+// Sans ce parametre, l'etape de provenance echouait en
+// « No such property: acrPublisher » -- exactement le defaut du build #9,
+// une couche plus haut.
+def reportToPlatform(script, telemetry, cleanup, reporter, acrPublisher, Map ctx) {
     script.timeout(time: PlatformConfig.TIMEOUT_POST_REPORT_MINUTES, unit: 'MINUTES') {
         try {
             def env = script.env
@@ -529,7 +534,21 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
             // gouvernance il n'est pas deployable. Le push, lui, reste SUCCESS.
             if (telemetry.imagePublication?.published == true) {
                 stage('Record Image Provenance') {
-                    acrPublisher.recordProvenance(telemetry.imagePublication, 6, 15)
+                    try {
+                        acrPublisher.recordProvenance(telemetry.imagePublication, 6, 15)
+                    } catch (provenanceError) {
+                        // R57 — une chaine de publication REQUISE qui echoue doit se voir
+                        // dans le resultat du build. Le catch de reporting ci-dessous est
+                        // deliberement non bloquant pour la TELEMETRIE ; il ne doit jamais
+                        // absorber un echec d'ARTEFACT. On marque donc ici, sans relancer,
+                        // pour que ce catch ne le reclasse pas en « non-fatal ».
+                        //
+                        // Faits historiques preserves : push_status reste SUCCESS, et
+                        // provenance_status vaut FAILED (pose par recordProvenance avant
+                        // son erreur).
+                        script.currentBuild.result = 'FAILURE'
+                        script.echo "REQUIRED ARTIFACT CHAIN FAILED: image published but provenance not recorded -- ${provenanceError.message}"
+                    }
                 }
             }
         } catch (ex) {
