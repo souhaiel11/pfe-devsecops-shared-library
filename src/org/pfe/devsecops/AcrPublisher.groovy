@@ -226,70 +226,6 @@ class AcrPublisher implements Serializable {
         }
     }
 
-    /**
-     * Records provenance through the platform's existing CI contract
-     * (POST /api/azure-deploy/artifacts/provenance, RegisterArtifactDto).
-     *
-     * No new endpoint and no new field. No `digest` is claimed: the backend
-     * resolves it from the registry through its agent and is authoritative. The
-     * DTO has no `registry` field -- the backend reads it from the project --
-     * and `provenanceVerified` is a result, never an input.
-     */
-    int registerProvenance(Map target, int buildNumber, String commitSha, String tag) {
-        Map body = [
-            projectId  : target.projectId,
-            buildNumber: buildNumber,
-            commitSha  : commitSha,
-            repository : target.repository,
-            tag        : tag
-        ]
-        steps.writeFile file: 'acr-provenance-request.json',
-            text: groovy.json.JsonOutput.toJson(body)
-        return steps.withEnv(["PFE_BACKEND_URL=${PlatformConfig.BACKEND_URL}"]) {
-            steps.sh(
-                returnStatus: true,
-                script: '''
-                    set -e
-                    CODE=$(curl -sS -o /tmp/acr_prov_resp.txt -w "%{http_code}" \
-                      -X POST "$PFE_BACKEND_URL/api/azure-deploy/artifacts/provenance" \
-                      -H "Content-Type: application/json" \
-                      -H "X-Internal-Secret: $N8N_INTERNAL_SECRET" \
-                      --data-binary @acr-provenance-request.json \
-                      --max-time 30)
-                    echo "provenance HTTP $CODE"
-                    cat /tmp/acr_prov_resp.txt || true
-                    echo ""
-
-                    # R58 -- le code HTTP n'est PAS le verdict. NestJS @Post
-                    # repond 201 meme pour un refus ; le verdict est dans le
-                    # corps : {"status":"REJECTED","failureCode":"..."}.
-                    # Ne lire que le code fabriquait un succes (build #10).
-                    case "$CODE" in
-                      2*) ;;
-                      *)  echo "provenance: transport/HTTP failure ($CODE)" ; exit 1 ;;
-                    esac
-
-                    STATUS=$(sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\\([A-Za-z_]*\\)".*/\\1/p' /tmp/acr_prov_resp.txt | head -1)
-                    FCODE=$(sed -n 's/.*"failureCode"[[:space:]]*:[[:space:]]*"\\([A-Za-z_]*\\)".*/\\1/p' /tmp/acr_prov_resp.txt | head -1)
-                    echo "provenance verdict: status=${STATUS:-<none>} failureCode=${FCODE:-<none>}"
-
-                    # Seul PROVENANCE_VERIFIED est un enregistrement CI valide.
-                    # UNVERIFIED_MANUAL_ARTIFACT est le chemin manuel : l'accepter
-                    # depuis la CI degraderait la garantie.
-                    if [ "$STATUS" = "PROVENANCE_VERIFIED" ]; then exit 0; fi
-
-                    # Refus RATTRAPABLE : la plateforme n'a pas encore correle ce
-                    # build (l'incident WF1 existe, mais sa sourceCommitSha n'est
-                    # pas encore persistee). Seul cas ou reessayer a un sens.
-                    if [ "$STATUS" = "REJECTED" ] && [ "$FCODE" = "DEPLOY_COMMIT_MISSING" ]; then exit 2; fi
-
-                    # Tout le reste est TERMINAL (mismatch de commit, build,
-                    # repository, digest, revision) : reessayer n'y changera rien.
-                    exit 1
-                '''
-            )
-        }
-    }
 
     // -- Stage 1 of 2: discover, verify, push --
     /**
@@ -297,10 +233,13 @@ class AcrPublisher implements Serializable {
      * build, because the artifact exists then and pushing needs no platform
      * state.
      *
-     * Provenance is deliberately NOT registered here: the backend re-derives
-     * build identity from the incident WF1 creates out of this build's
-     * end-of-pipeline report, so that incident does not exist yet. Registering
-     * now would be rejected for every project. See recordProvenance().
+     * Provenance is deliberately NOT registered here -- nor anywhere else in
+     * this pipeline (R59). The backend re-derives build identity from the
+     * incident WF1 creates out of this build's end-of-pipeline report, so that
+     * incident does not exist yet, and Jenkins must never try to guess when it
+     * will. The platform registers provenance itself, triggered by the
+     * persistence of that identity. Here we only mark PENDING: published, not
+     * yet recorded.
      */
     Map publishImage(Map args) {
         String jobName = args.jobName
@@ -383,60 +322,18 @@ class AcrPublisher implements Serializable {
         return [published: false, reason: reason]
     }
 
-    // -- Stage 2 of 2: record provenance, after the platform has the build --
-    /**
-     * Registers the published artifact's provenance, AFTER this build's report
-     * has been sent, because the backend re-derives build identity from the
-     * incident WF1 creates from that report. Ingestion is asynchronous, so this
-     * retries within a bounded window rather than assuming instant arrival.
-     *
-     * Fails the build when a published artifact cannot be recorded: under
-     * governance an unrecorded artifact is not deployable, so a green build
-     * implying otherwise would be a lie. The push itself stays SUCCESS.
-     */
-    void recordProvenance(Map publication, int attempts, int waitSeconds) {
-        if (!publication || publication.published != true) { return }
 
-        int buildNumber = 0
-        try { buildNumber = Integer.parseInt(String.valueOf(publication.buildNumber).trim()) }
-        catch (ignored) { buildNumber = 0 }
-        if (buildNumber < 1) {
-            telemetry.docker.provenance_status = 'FAILED'
-            steps.error("ACR_PROVENANCE_BUILD_NUMBER_INVALID: '${publication.buildNumber}' is not a usable build number for the provenance contract.")
-        }
+    // R59 — registerProvenance()/recordProvenance() ont ete SUPPRIMES.
+    //
+    // La provenance appartient desormais a la plateforme : son enregistrement
+    // est declenche causalement par la persistance de l'identite de build
+    // (ProvenanceReconciliationService), et non plus par Jenkins attendant
+    // derriere une fenetre devinee. Garder ici un ecrivain inutilise aurait
+    // laisse un SECOND ecrivain automatique latent, susceptible d'etre
+    // rebranche et d'entrer en course avec la plateforme.
+    //
+    // Ce que ce publisher fait encore : pousser l'image, puis poser
+    // provenance_status = PENDING -- « publie, pas encore enregistre » --
+    // et laisser la plateforme conclure.
 
-        int total = Math.max(1, attempts)
-        Map attempt = withInternalSecret {
-            int last = 1
-            for (int i = 1; i <= total; i++) {
-                last = registerProvenance(publication.target as Map, buildNumber,
-                    publication.commitSha as String, publication.tag as String)
-                if (last == 0) { return 0 }
-                // R58 -- 2 = refus RATTRAPABLE (DEPLOY_COMMIT_MISSING : la
-                // plateforme n'a pas encore correle ce build). Tout autre code
-                // non nul est TERMINAL : on arrete tout de suite plutot que de
-                // consommer la fenetre entiere sur un refus definitif.
-                if (last != 2) {
-                    steps.echo "Provenance refused on terminal grounds (attempt ${i}/${total}); retrying cannot help."
-                    return last
-                }
-                if (i < total) {
-                    steps.echo "Provenance not recorded yet (attempt ${i}/${total}); the platform has not correlated this build yet. Retrying."
-                    steps.sleep(time: waitSeconds, unit: 'SECONDS')
-                }
-            }
-            return last
-        }
-
-        if (!attempt.ok) {
-            telemetry.docker.provenance_status = 'FAILED'
-            steps.error("ACR_PROVENANCE_SECRET_UNAVAILABLE (${attempt.reason}): the image was published but provenance cannot be recorded without the platform internal secret.")
-        }
-        if (attempt.value != 0) {
-            telemetry.docker.provenance_status = 'FAILED'
-            steps.error('ACR_PROVENANCE_REGISTRATION_FAILED: the image was published but the platform refused or could not record its provenance. Failing the build: an unrecorded artifact is not deployable under governance.')
-        }
-        telemetry.docker.provenance_status = 'SUCCESS'
-        steps.echo "Provenance recorded for ${telemetry.docker.published_reference}. Published is not deployed: no deployment state is implied."
-    }
 }

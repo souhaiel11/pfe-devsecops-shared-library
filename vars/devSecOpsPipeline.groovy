@@ -275,7 +275,7 @@ def call(Closure body = null) {
                 // N8N_API_KEY must stay bound through the platform callback below, on
                 // every path including a checkout failure -- WF1 must be notified of a
                 // pre-stage failure too, not just of completed runs.
-                reportToPlatform(this, telemetry, cleanup, reporter, acrPublisher, [
+                reportToPlatform(this, telemetry, cleanup, reporter, [
                     applicationName: applicationName, imageName: imageName, imageTag: imageTag,
                     isPR: isPR, reportBase: reportBase, n8nReportBase: n8nReportBase,
                     checkoutFailed: checkoutFailed, stageFailure: stageFailure, zapTargetUrl: zapTargetUrl, zapStageEntered: zapStageEntered,
@@ -320,12 +320,12 @@ def applicationServiceName(String zapTargetUrl) {
  * around (Section 13). Any failure here is swallowed and logged: it must
  * never mask the pipeline's real result (Section 14).
  */
-// R57 — acrPublisher est passe EXPLICITEMENT : reportToPlatform est une
-// methode distincte de call(), elle ne capture donc aucune de ses locales.
-// Sans ce parametre, l'etape de provenance echouait en
-// « No such property: acrPublisher » -- exactement le defaut du build #9,
-// une couche plus haut.
-def reportToPlatform(script, telemetry, cleanup, reporter, acrPublisher, Map ctx) {
+// R59 — acrPublisher n'est plus un parametre : cette methode n'enregistre plus
+// aucune provenance (ecrivain unique = la plateforme). La lecon du build #9
+// reste valable pour tout futur collaborateur ajoute ici : reportToPlatform est
+// une methode DISTINCTE de call() et ne capture aucune de ses locales, donc
+// tout collaborateur doit etre passe explicitement.
+def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
   try {
     script.timeout(time: PlatformConfig.TIMEOUT_POST_REPORT_MINUTES, unit: 'MINUTES') {
         try {
@@ -532,34 +532,27 @@ def reportToPlatform(script, telemetry, cleanup, reporter, acrPublisher, Map ctx
         }
     }
 
-    // R58 — la provenance est SORTIE de la fenetre de rapport, parce qu'elle
-    // attend un evenement qui arrive APRES l'envoi du rapport : la persistance
-    // de sourceCommitSha par WF1 (104 s au build #10, pour une fenetre de
-    // rapport de 120 s au total). Elle garde son propre budget, et le rapport
-    // garde son garde-fou de 2 min inchange.
+    // R59 — Jenkins n'enregistre PLUS la provenance. UN SEUL ecrivain
+    // automatique, et c'est la plateforme.
     //
-    // Elle reste AVANT cleanup.safeDeleteDir() : registerProvenance ecrit
-    // acr-provenance-request.json et a donc besoin du workspace.
-    if (telemetry.imagePublication?.published == true) {
-        try {
-            script.timeout(time: PlatformConfig.TIMEOUT_PROVENANCE_MINUTES, unit: 'MINUTES') {
-                stage('Record Image Provenance') {
-                    acrPublisher.recordProvenance(telemetry.imagePublication,
-                        PlatformConfig.PROVENANCE_ATTEMPTS, PlatformConfig.PROVENANCE_WAIT_SECONDS)
-                }
-            }
-        } catch (provenanceError) {
-            // R57 — une chaine de publication REQUISE qui echoue doit se voir dans
-            // le resultat du build. Le catch de reporting ci-dessus est
-            // deliberement non bloquant pour la TELEMETRIE ; il ne doit jamais
-            // absorber un echec d'ARTEFACT -- d'ou ce bloc separe.
-            //
-            // Faits historiques preserves : push_status reste SUCCESS, et
-            // provenance_status vaut FAILED (pose par recordProvenance).
-            script.currentBuild.result = 'FAILURE'
-            script.echo "REQUIRED ARTIFACT CHAIN FAILED: image published but provenance not recorded -- ${provenanceError.message}"
-        }
-    }
+    // Pourquoi : le backend re-derive l'identite de build depuis l'incident que
+    // WF1 cree a partir de CE rapport. Jenkins devait donc DEVINER quand cette
+    // ecriture aurait lieu et attendre derriere une fenetre (104 s mesures au
+    // build #10 pour un budget de 90 s). Elargir la fenetre ne rend pas cela
+    // correct, seulement « souvent vrai » : la correction dependait d'une
+    // course.
+    //
+    // Desormais le declencheur est CAUSAL : la persistance de
+    // sourceCommitSha + enrichedData.docker (un seul PUT atomique) declenche
+    // elle-meme l'enregistrement cote backend
+    // (ProvenanceReconciliationService). Une ingestion lente reste correcte, et
+    // une panne transitoire est re-tentable via
+    // POST /api/azure-deploy/artifacts/provenance/reconcile/:incidentId -- sans
+    // reconstruire ni repousser une image identique.
+    //
+    // Ce que Jenkins fait encore, et c'est tout : pousser l'image, puis
+    // rapporter honnetement ses coordonnees avec provenance_status = PENDING.
+    // PENDING n'est pas un echec : c'est « publie, pas encore enregistre ».
   } finally {
     cleanup.safeDeleteDir()
   }

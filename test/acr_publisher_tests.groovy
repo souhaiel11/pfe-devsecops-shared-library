@@ -237,91 +237,42 @@ String allScripts = c2.shScripts.join('\n')
 check(!(allScripts =~ /(^|\s)az\s/), 'MODE — aucun script du publisher n\'appelle az')
 
 // ════════════════════════════════════════════════════════════════════════════
-// 6. PROVENANCE — apres ingestion, contrat existant, digest non revendique
+// 6. R59 — LA BIBLIOTHEQUE N'ENREGISTRE PLUS AUCUNE PROVENANCE
+//
+// L'ecrivain a ete retire, pas seulement debranche : garder un
+// registerProvenance()/recordProvenance() inutilise aurait laisse un SECOND
+// ecrivain automatique latent, rebranchable, en course avec la plateforme.
+//
+// La semantique durement acquise au build #10 (201 n'est pas un verdict, seul
+// PROVENANCE_VERIFIED vaut succes, UNVERIFIED_MANUAL_ARTIFACT jamais accepte,
+// corps illisible jamais un succes, DEPLOY_COMMIT_MISSING seul rattrapable)
+// n'est PAS perdue : elle vit desormais chez l'ecrivain unique, et y est
+// testee -- backend/src/azure-deploy/provenance-reconciliation.spec.ts.
 // ════════════════════════════════════════════════════════════════════════════
-def pv = stepsWith([:], [])
-int code = new AcrPublisher(pv, new StageTelemetry())
-        .registerProvenance(t, 8, SHA, '8-a1b2c3d4e5f6')
-check(code == 0, 'PROVENANCE — un code de sortie 0 du script est un succes')
-def sent = new groovy.json.JsonSlurperClassic().parseText(pv.writtenFiles['acr-provenance-request.json'])
-check(sent.projectId == projectWithAcr.id && sent.buildNumber == 8 && sent.commitSha == SHA
-        && sent.repository == 'my-app' && sent.tag == '8-a1b2c3d4e5f6',
-    'PROVENANCE — projet, build, commit COMPLET, depot et tag sont transmis')
-check(sent.commitSha.length() == 40,
-    'PROVENANCE — le commit autoritaire est le sha COMPLET, pas le prefixe du tag')
-check(!sent.containsKey('digest'),
-    'PROVENANCE — aucun digest revendique : le backend le resout et en est l\'autorite')
-check(!sent.containsKey('registry'), 'PROVENANCE — aucun champ registry (absent du DTO)')
-check(!sent.containsKey('provenanceVerified') && !sent.containsKey('deployed'),
-    'PROVENANCE — aucun resultat ni etat de deploiement en entree')
-String provScript = pv.shScripts.find { it.contains('artifacts/provenance') }
-check(provScript.contains('/api/azure-deploy/artifacts/provenance'),
-    'PROVENANCE — endpoint CI existant, aucun nouveau')
-check(provScript.contains('$N8N_INTERNAL_SECRET'), 'PROVENANCE — secret depuis l\'environnement')
-// R58 — cette assertion epinglait l'ANCIEN motif (« 2xx => succes »), celui-la
-// meme qui a fabrique un succes au build #10. Le contrat correct : le code HTTP
-// ne decide que du transport, le verdict se lit dans le corps.
-check(provScript.contains('transport/HTTP failure'),
-    'PROVENANCE — un code non-2xx propage un echec de transport')
-check(provScript.contains('PROVENANCE_VERIFIED'),
-    'PROVENANCE — seul le statut PROVENANCE_VERIFIED du corps vaut succes')
-check(provScript.contains('DEPLOY_COMMIT_MISSING'),
-    'PROVENANCE — un refus de correlation est rattrapable (exit 2), pas un succes')
-check(!provScript.contains('case "$CODE" in 2*) exit 0'),
-    'PROVENANCE — l\'ancien « 2xx => succes » a disparu du script genere')
+String pubSrc = new File("${System.getenv('LIB_ROOT') ?: '.'}/src/org/pfe/devsecops/AcrPublisher.groovy").text
+check(!pubSrc.contains('int registerProvenance('),
+    'R59 — registerProvenance() a ete supprime de AcrPublisher')
+check(!pubSrc.contains('void recordProvenance('),
+    'R59 — recordProvenance() a ete supprime de AcrPublisher')
+check(!AcrPublisher.declaredMethods.any { it.name in ['registerProvenance', 'recordProvenance'] },
+    'R59 — la classe compilee n\'expose plus aucune methode d\'enregistrement')
 
-// ── recordProvenance : reessaie pendant que la plateforme ingere ──────────
-def retry = stepsWith([:], [])
-int calls = 0
-// R58 — 2 = refus RATTRAPABLE (la plateforme n'a pas encore correle ce build).
-// Auparavant ce test utilisait 1, qui designe desormais un refus TERMINAL.
-retry.statusDecider = { String s -> s.contains('artifacts/provenance') ? (++calls >= 3 ? 0 : 2) : 0 }
-def telR = new StageTelemetry(); telR.checkoutFullSha = SHA
-telR.docker.push_status = 'SUCCESS'
-telR.docker.published_reference = 'myregistry.azurecr.io/my-app:8-a1b2c3d4e5f6'
-new AcrPublisher(retry, telR).recordProvenance(
-    [published: true, target: t, tag: '8-a1b2c3d4e5f6', commitSha: SHA, buildNumber: '8'], 5, 1)
-check(telR.docker.provenance_status == 'SUCCESS',
-    'INGESTION — la provenance reussit apres que la plateforme a ingere le build')
-check(calls == 3, 'INGESTION — les tentatives sont bornees et reellement reessayees')
-check(telR.docker.push_status == 'SUCCESS', 'INGESTION — le push reste SUCCESS')
+// Ce que la publication CONSERVE : pousser, puis annoncer PENDING.
+def pendOnly = stepsWith(['internal/by-job': projectJson, 'image inspect': SHA + '\n'], [])
+def telPend = new StageTelemetry(); telPend.checkoutFullSha = SHA
+new AcrPublisher(pendOnly, telPend).publishImage(
+    [jobName: 'my-app', imageName: 'my-app', imageTag: '8', requirePublish: false])
+check(telPend.docker.push_status == 'SUCCESS', 'R59 — la publication reste le travail de Jenkins')
+check(telPend.docker.provenance_status == 'PENDING',
+    'R59 — « publie, pas encore enregistre » : PENDING, jamais un faux succes')
+check(!pendOnly.shScripts.any { it.contains('artifacts/provenance') },
+    'R59 — publier ne declenche aucun enregistrement de provenance')
+// Le secret interne reste requis pour DECOUVRIR le projet
+// (/projects/internal/by-job) : c'est de la configuration, pas de la
+// provenance. Ce qui a disparu, c'est l'appel d'ENREGISTREMENT.
+check(pendOnly.shScripts.any { it.contains('internal/by-job') },
+    'R59 - la decouverte du projet reste un appel plateforme legitime')
 
-// ── push SUCCESS + provenance definitivement refusee ─────────────────────
-def provFail = stepsWith([:], [])
-provFail.statusDecider = { String s -> s.contains('artifacts/provenance') ? 1 : 0 }
-def telPF = new StageTelemetry(); telPF.checkoutFullSha = SHA
-telPF.docker.push_status = 'SUCCESS'
-telPF.docker.published_tag = '8-a1b2c3d4e5f6'
-boolean threwPF = false; String msgPF = ''
-try {
-    new AcrPublisher(provFail, telPF).recordProvenance(
-        [published: true, target: t, tag: '8-a1b2c3d4e5f6', commitSha: SHA, buildNumber: '8'], 2, 1)
-} catch (err) { threwPF = true; msgPF = err.message }
-check(threwPF && msgPF.contains('ACR_PROVENANCE_REGISTRATION_FAILED'),
-    'PUSH OK / PROVENANCE KO — le build echoue')
-check(telPF.docker.push_status == 'SUCCESS',
-    'PUSH OK / PROVENANCE KO — le fait historique du push n\'est PAS reecrit')
-check(telPF.docker.provenance_status == 'FAILED',
-    'PUSH OK / PROVENANCE KO — provenance = FAILED, deux faits distincts')
-check(telPF.docker.published_tag == '8-a1b2c3d4e5f6',
-    'PUSH OK / PROVENANCE KO — les coordonnees publiees restent vraies')
-
-// ── rien n'est enregistre si rien n'a ete publie ─────────────────────────
-def noPub = stepsWith([:], [])
-new AcrPublisher(noPub, new StageTelemetry()).recordProvenance([published: false], 3, 1)
-check(noPub.shScripts.isEmpty(), 'NON PUBLIE — aucune provenance n\'est tentee')
-
-// ── secret interne absent au moment de l'enregistrement ──────────────────
-def noSecret = stepsWith([:], [SECRET_ID])
-def telNS = new StageTelemetry(); telNS.docker.push_status = 'SUCCESS'
-boolean threwNS = false; String msgNS = ''
-try {
-    new AcrPublisher(noSecret, telNS).recordProvenance(
-        [published: true, target: t, tag: '8-a1b2c3d4e5f6', commitSha: SHA, buildNumber: '8'], 2, 1)
-} catch (err) { threwNS = true; msgNS = err.message }
-check(threwNS && msgNS.contains('ACR_PROVENANCE_SECRET_UNAVAILABLE'),
-    'PROVENANCE — un artefact publie non enregistrable fait echouer le build')
-check(telNS.docker.push_status == 'SUCCESS', 'PROVENANCE — le push reste SUCCESS')
 
 // ════════════════════════════════════════════════════════════════════════════
 // 7. AUCUNE SEMANTIQUE DE DEPLOIEMENT
@@ -372,262 +323,73 @@ check(!globalBlock.contains('CRED_INTERNAL_SECRET'),
 check(globalBlock.contains('CRED_SONAR_TOKEN') && globalBlock.contains('CRED_NVD_API_KEY'),
     'PORTEE — les identifiants reellement globaux restent lies')
 check(pipeline.contains('acrPublisher.publishImage('), 'PORTEE — l\'etape de publication appelle publishImage')
-check(pipeline.contains('acrPublisher.recordProvenance('), 'PORTEE — la provenance a sa propre etape')
+// R59 — plus d'etape de provenance : la seule chose que le pipeline demande
+// encore au publisher, c'est de publier.
+check(!pipeline.contains('acrPublisher.recordProvenance('),
+    'R59 - le pipeline ne demande plus d\'enregistrement au publisher')
 int sendIdx = pipeline.indexOf('reporter.send(')
-int provIdx = pipeline.indexOf('acrPublisher.recordProvenance(')
-check(sendIdx > 0 && provIdx > sendIdx,
-    'SEQUENCE — la provenance est enregistree APRES l\'envoi du rapport (le backend a besoin de l\'incident)')
+// R59 — la contrainte « enregistrer apres le rapport » a disparu avec
+// l'ecrivain : ce n'est plus une question d'ordre dans le pipeline, mais de
+// causalite cote plateforme (la persistance declenche l'enregistrement).
+check(sendIdx > 0, 'SEQUENCE — le rapport est bien envoye par le pipeline')
 int publishIdx = pipeline.indexOf('acrPublisher.publishImage(')
 check(publishIdx > 0 && publishIdx < sendIdx,
     'SEQUENCE — le push a lieu avant le rapport, pour que ses faits y figurent')
 
 // ════════════════════════════════════════════════════════════════════════════
 // ════════════════════════════════════════════════════════════════════════════
-// 10. R56 — le resultat de publication voyage par la TELEMETRIE
-// Defaut reel du build #9 : une locale typee affectee dans la closure
-// withCredentials n'etait plus visible dans le bloc de rapport, et l'etape de
-// provenance ne tournait jamais (« No such property: imagePublication »).
-// ════════════════════════════════════════════════════════════════════════════
-def st = stepsWith(['internal/by-job': projectJson, 'image inspect': SHA + '\n'], [])
-def tp = new StageTelemetry(); tp.checkoutFullSha = SHA
-check(tp.imagePublication?.published == false,
-  'TELEMETRIE — imagePublication part d\'un etat non publie')
-def res = new AcrPublisher(st, tp).publishImage(jobName: 'my-app', imageName: 'my-app', imageTag: '8')
-check(tp.imagePublication?.published == true,
-  'TELEMETRIE — une publication reussie est portee par telemetry, pas par une locale')
-check(tp.imagePublication?.tag == res.tag && tp.imagePublication?.commitSha == SHA,
-  'TELEMETRIE — telemetry porte le meme resultat que la valeur retournee')
-
-// Projet sans registre : la telemetrie dit explicitement « non publie ».
-def st2 = stepsWith(['internal/by-job': noAcrJson], [])
-def tp2 = new StageTelemetry(); tp2.checkoutFullSha = SHA
-new AcrPublisher(st2, tp2).publishImage(jobName: 'x', imageName: 'x', imageTag: '3')
-check(tp2.imagePublication?.published == false,
-  'TELEMETRIE — un projet sans registre reste non publie dans la telemetrie')
-check(tp2.imagePublication?.reason != null,
-  'TELEMETRIE — le motif accompagne l\'absence de publication')
-
-// Le pipeline doit LIRE la telemetrie, et ne plus declarer de locale.
-String pipe = new File("${System.getenv('LIB_ROOT') ?: '.'}/vars/devSecOpsPipeline.groovy").text
-check(pipe.contains('telemetry.imagePublication?.published == true'),
-  'PIPELINE — la garde lit telemetry.imagePublication')
-check(pipe.contains('recordProvenance(telemetry.imagePublication'),
-  'PIPELINE — recordProvenance recoit la valeur portee par telemetry')
-check(!(pipe =~ /Map imagePublication\s*=/),
-  'PIPELINE — plus aucune locale imagePublication (invisible depuis le bloc de rapport)')
-check(!(pipe =~ /\n\s+imagePublication\s*=\s*acrPublisher/),
-  'PIPELINE — plus aucune affectation de locale depuis la closure withCredentials')
-
-// ════════════════════════════════════════════════════════════════════════════
-// 9. R57 — INVARIANT : CHAINE D'ARTEFACT REQUISE != TELEMETRIE NON BLOQUANTE
+// 10. R59 — LE PIPELINE NON PLUS N'ENREGISTRE RIEN
 //
-// Une provPublication d'image reussie dont la provenance echoue VRAIMENT ne doit
-// pas laisser le build en SUCCESS. L'echec de reporting, lui, reste
-// deliberement non bloquant. Les deux chemins doivent rester distincts.
-// ════════════════════════════════════════════════════════════════════════════
-
-// ── a. anti-regression de PORTEE (la classe de bug du build #9) ───────────
-// reportToPlatform est une METHODE distincte de call() : elle ne capture
-// aucune locale de call(). Tout collaborateur doit donc etre un PARAMETRE.
-def sigMatch = (pipe =~ /def reportToPlatform\(([^)]*)\)/)
-check(sigMatch.find(), 'PORTEE — la signature de reportToPlatform est analysable')
-String reportParams = sigMatch.group(1)
-check(reportParams.contains('acrPublisher'),
-  'PORTEE — acrPublisher est un PARAMETRE de reportToPlatform, pas une locale de call()')
-check((pipe =~ /reportToPlatform\(this,\s*telemetry,\s*cleanup,\s*reporter,\s*acrPublisher,/).find(),
-  'PORTEE — le site d\'appel transmet effectivement acrPublisher')
-
-// Toute locale de call() utilisee dans reportToPlatform sans etre passee
-// reproduirait le defaut du build #9. On verifie les collaborateurs connus.
-int reportStart = pipe.indexOf('def reportToPlatform(')
-String reportBody = pipe.substring(reportStart)
-['acrPublisher', 'telemetry', 'cleanup', 'reporter'].each { collaborator ->
-    if (reportBody =~ /(?<![\w.])${collaborator}\./) {
-        check(reportParams.contains(collaborator),
-          "PORTEE — ${collaborator}, utilise dans reportToPlatform, y est bien un parametre")
-    }
-}
-
-// ── b. l'etape de provenance a son PROPRE catch ───────────────────────────
-// On isole le bloc de provenance par ses propres bornes (de son `if` jusqu'au
-// `finally` de nettoyage) : aucune dependance a l'indentation, qui a change
-// quand la provenance a recu sa propre fenetre (R58).
-int provIfAt = pipe.indexOf('if (telemetry.imagePublication?.published == true)')
-check(provIfAt > 0, 'INVARIANT — le bloc de provenance est localisable')
-int provFinallyAt = pipe.indexOf('finally', provIfAt)
-check(provFinallyAt > provIfAt, 'INVARIANT — le finally de nettoyage suit le bloc')
-String provenanceStage = pipe.substring(provIfAt, provFinallyAt)
-
-check(provenanceStage.contains("stage('Record Image Provenance')"),
-  'INVARIANT — le bloc contient bien l\'etape de provenance')
-check(provenanceStage.contains('try {') && (provenanceStage =~ /catch\s*\(/).find(),
-  'INVARIANT — la provenance ne delegue plus son echec au catch de reporting')
-check((provenanceStage =~ /currentBuild\.result\s*=\s*'FAILURE'/).find(),
-  'INVARIANT — un echec de provenance marque le build en FAILURE')
-check(provenanceStage.contains('REQUIRED ARTIFACT CHAIN FAILED'),
-  'INVARIANT — l\'echec est annonce comme un echec d\'artefact')
-
-// ── c. le catch de reporting reste, lui, non bloquant ─────────────────────
-// Deux chemins distincts : l'artefact bloque, la telemetrie non. On isole le
-// catch de reporting, qui precede desormais le bloc de provenance.
-int reportCatchAt = pipe.indexOf('Reporting failed (non-fatal')
-check(reportCatchAt > 0, 'INVARIANT — le catch de reporting est localisable')
-check(reportCatchAt < provIfAt,
-  'INVARIANT — le reporting est termine avant que la provenance commence')
-// Le corps du catch de reporting : de son `catch (ex)` a la fin de son bloc.
-int reportCatchStart = pipe.lastIndexOf('catch (ex)', reportCatchAt)
-check(reportCatchStart > 0, 'INVARIANT — le catch de reporting est analysable')
-String reportCatchBody = pipe.substring(reportCatchStart, provIfAt)
-check(!(reportCatchBody =~ /currentBuild\.result\s*=/),
-  'INVARIANT — un echec de REPORTING ne touche toujours pas le resultat du build')
-
-// ── d. composition : provenance KO => push SUCCESS + FAILED + FAILURE ─────
-// On rejoue la composition exacte de l'etape (recordProvenance dans un try
-// dont le catch marque le build), avec un enregistrement qui echoue vraiment.
-def provFailBuild = [result: null]
-def provFailSteps = stepsWith([:], [SECRET_ID])   // secret interne indisponible
-def telInv = new StageTelemetry()
-telInv.docker.build_status = 'SUCCESS'
-telInv.docker.push_status  = 'SUCCESS'
-telInv.docker.published_tag = '10-a1b2c3d4e5f6'
-def provPublication = [published: true, target: t, tag: '10-a1b2c3d4e5f6',
-                   commitSha: SHA, buildNumber: '10']
-try {
-    new AcrPublisher(provFailSteps, telInv).recordProvenance(provPublication, 2, 1)
-} catch (provenanceError) {
-    provFailBuild.result = 'FAILURE'
-}
-check(telInv.docker.push_status == 'SUCCESS',
-  'COMPOSITION — push SUCCESS : le fait historique survit a l\'echec de provenance')
-check(telInv.docker.provenance_status == 'FAILED',
-  'COMPOSITION — provenance_status = FAILED')
-check(provFailBuild.result == 'FAILURE',
-  'COMPOSITION — la chaine de publication REQUISE fait echouer le build')
-check(telInv.docker.published_tag == '10-a1b2c3d4e5f6',
-  'COMPOSITION — les coordonnees publiees restent vraies')
-
-// Et le cas miroir : provenance OK => le build n'est pas marque.
-def provOkBuild = [result: null]
-def provOkSteps = stepsWith([:], [])
-def telProvOk = new StageTelemetry()
-telProvOk.docker.push_status = 'SUCCESS'
-try {
-    new AcrPublisher(provOkSteps, telProvOk).recordProvenance(provPublication, 2, 1)
-} catch (provenanceError) {
-    provOkBuild.result = 'FAILURE'
-}
-check(provOkBuild.result == null,
-  'COMPOSITION — provenance OK : le build n\'est pas marque en echec')
-
-// ════════════════════════════════════════════════════════════════════════════
-// 10. R58 — REPRISE : rattrapable vs terminal, et dimension de la fenetre
+// Les sections R56/R57/R58 testaient l'ecrivain Jenkins : la portee de
+// `imagePublication`, l'invariant « une chaine d'artefact requise en echec ne
+// doit pas rester SUCCESS », la taille de la fenetre de reprise. Cet ecrivain
+// n'existe plus, donc ces tests non plus -- les supprimer est le seul resultat
+// honnete : des assertions sur du code absent passeraient pour la mauvaise
+// raison.
 //
-// Diagnostic du build #10 : le backend a refuse avec DEPLOY_COMMIT_MISSING
-// parce que WF1 n'avait pas encore persiste sourceCommitSha sur l'incident
-// (104 s APRES l'envoi du rapport). La reprise existait deja — mais elle n'a
-// jamais demarre, parce que le verdict etait lu dans le code HTTP.
+// Ce qui les remplace : la preuve qu'il ne reste AUCUN ecrivain cote Jenkins.
+// Ce que l'invariant protegeait devient structurel -- Jenkins ne peut plus
+// masquer l'echec d'un enregistrement qu'il ne tente pas.
 // ════════════════════════════════════════════════════════════════════════════
-
-def p58_provTarget = [projectId: projectWithAcr.id, registry: 'acrpfedevsecops',
-                  repository: 'app-test-pfe-vermeg']
-def p58_provPub = [published: true, target: p58_provTarget, tag: '10-f02b6fb4d2b2',
-               commitSha: SHA, buildNumber: '10']
-
-// helper : pilote les codes de sortie successifs du POST de provenance
-def p58_provSteps = { List codes ->
-    def s = new FakeSteps()
-    s.missingCredentialIds = [] as Set
-    int[] n = [0]
-    s.statusDecider = { String script ->
-        if (!script.contains('artifacts/provenance')) { return null }
-        int i = n[0]; n[0] = i + 1
-        return i < codes.size() ? codes[i] : codes[codes.size() - 1]
-    }
-    return s
+String pipeSrc = new File("${System.getenv('LIB_ROOT') ?: '.'}/vars/devSecOpsPipeline.groovy").text
+def codeOnly = { String src ->
+    src.split('\n').findAll { String line ->
+        String s2 = line.trim()
+        !(s2.startsWith('//') || s2.startsWith('*') || s2.startsWith('/*'))
+    }.join('\n')
 }
-def p58_provCalls = { steps -> steps.shScripts.count { it.contains('artifacts/provenance') } }
+String pipeCode = codeOnly(pipeSrc)
 
-// ── a. rattrapable puis verifie : la reprise fait son travail ─────────────
-def p58_rs = p58_provSteps([2, 2, 0])
-def p58_telR = new StageTelemetry(); p58_telR.docker.push_status = 'SUCCESS'
-p58_telR.docker.published_reference = 'acrpfedevsecops.azurecr.io/app-test-pfe-vermeg:10-f02b6fb4d2b2'
-new AcrPublisher(p58_rs, p58_telR).recordProvenance(p58_provPub, 12, 20)
-check(p58_telR.docker.provenance_status == 'SUCCESS',
-  'R58 — 2,2,0 : la reprise aboutit, provenance_status = SUCCESS')
-check(p58_provCalls(p58_rs) == 3, "R58 — exactement 3 tentatives, pas plus (obtenu ${p58_provCalls(p58_rs)})")
-check(p58_rs.echoed.any { it.contains('has not correlated this build yet') },
-  'R58 — l\'attente est annoncee honnetement comme une non-correlation')
+check(!pipeCode.contains('recordProvenance'),
+    'R59 - le pipeline n\'appelle plus recordProvenance')
+check(!pipeCode.contains("stage('Record Image Provenance')"),
+    'R59 - l\'etape Record Image Provenance n\'existe plus')
+check(!pipeCode.contains('artifacts/provenance'),
+    'R59 - aucun appel a l\'endpoint de provenance dans le code du pipeline')
+check(!pipeCode.contains('TIMEOUT_PROVENANCE_MINUTES'),
+    'R59 - plus aucune fenetre d\'attente de provenance a dimensionner')
+check(!pipeCode.contains('PROVENANCE_ATTEMPTS'),
+    'R59 - plus aucun budget de reprise cote Jenkins')
 
-// ── b. rattrapable jusqu'au bout : echec explicite, jamais un faux succes ─
-def p58_xs = p58_provSteps([2])
-def p58_telX = new StageTelemetry(); p58_telX.docker.push_status = 'SUCCESS'
-boolean p58_threwX = false; String p58_msgX = ''
-try { new AcrPublisher(p58_xs, p58_telX).recordProvenance(p58_provPub, 4, 1) }
-catch (err) { p58_threwX = true; p58_msgX = err.message }
-check(p58_threwX && p58_msgX.contains('ACR_PROVENANCE_REGISTRATION_FAILED'),
-  'R58 — budget epuise sur un refus rattrapable : echec explicite')
-check(p58_telX.docker.provenance_status == 'FAILED', 'R58 — provenance_status = FAILED')
-check(p58_telX.docker.push_status == 'SUCCESS', 'R58 — le push reste SUCCESS')
-check(p58_provCalls(p58_xs) == 4, "R58 — tout le budget est consomme (obtenu ${p58_provCalls(p58_xs)})")
+// Le resultat de publication voyage par la telemetrie (lecon R56). Depuis que
+// le pipeline ne lit plus ce champ, c'est le PUBLISHER qui doit le porter.
+String pubSrc2 = new File("${System.getenv('LIB_ROOT') ?: '.'}/src/org/pfe/devsecops/AcrPublisher.groovy").text
+check(pubSrc2.contains('telemetry.imagePublication'),
+    'R59 - le resultat de publication est porte par la telemetrie, jamais par une locale')
+check(!(pipeCode =~ /\n\s+Map imagePublication\s*=/),
+    'R59 - aucune locale imagePublication ne reapparait')
 
-// ── c. refus TERMINAL : on arrete a la 1re, sans bruler la fenetre ────────
-def p58_ts2 = p58_provSteps([1])
-def p58_telT = new StageTelemetry(); p58_telT.docker.push_status = 'SUCCESS'
-boolean p58_threwT = false
-try { new AcrPublisher(p58_ts2, p58_telT).recordProvenance(p58_provPub, 12, 20) }
-catch (err) { p58_threwT = true }
-check(p58_threwT, 'R58 — un refus terminal fait echouer le build')
-check(p58_provCalls(p58_ts2) == 1,
-  "R58 — un refus terminal n'est PAS reessaye (1 tentative, obtenu ${p58_provCalls(p58_ts2)})")
-check(p58_ts2.echoed.any { it.contains('terminal grounds') },
-  'R58 — le caractere terminal est annonce')
-check(p58_telT.docker.provenance_status == 'FAILED', 'R58 — terminal => FAILED')
+check(pipeCode.contains('def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx)'),
+    'R59 - reportToPlatform ne prend plus acrPublisher')
+check(pipeCode.contains('reportToPlatform(this, telemetry, cleanup, reporter, ['),
+    'R59 - le site d\'appel correspond a la nouvelle signature')
 
-// ── d. aucune tentative ne peut conclure sur le seul code HTTP ────────────
-String p58_srcProv = new File("${System.getenv('LIB_ROOT') ?: '.'}/src/org/pfe/devsecops/AcrPublisher.groovy").text
-int p58_verdictStart = p58_srcProv.indexOf('# R58 -- le code HTTP')
-check(p58_verdictStart > 0, 'R58 — le bloc de verdict est present dans la source')
-String p58_verdictBlock = p58_srcProv.substring(p58_verdictStart)
-String p58_TRIPLE = new String([39, 39, 39] as char[])
-int p58_verdictEnd = p58_verdictBlock.indexOf(p58_TRIPLE)
-p58_verdictBlock = p58_verdictEnd > 0 ? p58_verdictBlock.substring(0, p58_verdictEnd) : p58_verdictBlock
-check(p58_verdictBlock.contains('PROVENANCE_VERIFIED'),
-  'R58 — le succes est conditionne au statut PROVENANCE_VERIFIED du corps')
-check(!p58_verdictBlock.contains('case "$CODE" in 2*) exit 0'),
-  'R58 — l\'ancien « 2xx => succes » a disparu')
-check(p58_verdictBlock.contains('DEPLOY_COMMIT_MISSING'),
-  'R58 — seul DEPLOY_COMMIT_MISSING est traite comme rattrapable')
+check(pipeSrc.contains('Reporting failed (non-fatal, original build result preserved)'),
+    'R59 - la semantique non bloquante du reporting est inchangee')
 
-// ── e. la fenetre couvre reellement la course mesuree ─────────────────────
-// Build #10 : POST a ~21:14:16, sourceCommitSha persistee a 21:16:00 => 104 s.
-int p58_budget = PlatformConfig.PROVENANCE_ATTEMPTS * PlatformConfig.PROVENANCE_WAIT_SECONDS
-check(p58_budget > 104,
-  "R58 — le budget de reprise (${p58_budget} s) couvre la course mesuree au build #10 (104 s)")
-check(p58_budget < PlatformConfig.TIMEOUT_PROVENANCE_MINUTES * 60,
-  "R58 — le budget (${p58_budget} s) tient dans sa propre fenetre (${PlatformConfig.TIMEOUT_PROVENANCE_MINUTES} min)")
-check(PlatformConfig.TIMEOUT_PROVENANCE_MINUTES * 60 > 104,
-  'R58 — la fenetre de provenance est plus large que la course mesuree')
-// Le point structurel : l'ancien p58_budget tenait dans la fenetre du RAPPORT, donc
-// aucune reprise utile n'etait possible la ou elle etait placee.
-check(p58_budget > PlatformConfig.TIMEOUT_POST_REPORT_MINUTES * 60,
-  'R58 — le budget depasse la fenetre de rapport : il DOIT donc vivre hors d\'elle')
+check(pipeSrc.contains('artifacts/provenance') && !pipeCode.contains('artifacts/provenance'),
+    'R59 - controle : l\'endpoint n\'est plus mentionne que dans un commentaire explicatif')
 
-// ── f. structure : la provenance a sa propre fenetre, hors du rapport ─────
-int p58_reportTimeoutAt = pipe.indexOf('TIMEOUT_POST_REPORT_MINUTES')
-int p58_provTimeoutAt   = pipe.indexOf('TIMEOUT_PROVENANCE_MINUTES', p58_reportTimeoutAt)
-int p58_provStageAt     = pipe.indexOf("stage('Record Image Provenance')")
-// anchre APRES l'etape : la premiere occurrence textuelle est un commentaire
-// qui mentionne l'appel, pas l'appel lui-meme.
-int p58_cleanupAt       = pipe.indexOf('cleanup.safeDeleteDir()', p58_provStageAt)
-check(p58_provTimeoutAt > 0, 'R58 — la provenance a sa propre fenetre nommee')
-check(p58_provStageAt > p58_provTimeoutAt,
-  'R58 — l\'etape de provenance est bien dans SA fenetre')
-check(p58_provStageAt > pipe.indexOf('Reporting failed (non-fatal'),
-  'R58 — l\'etape est APRES le catch de reporting, donc hors de la fenetre du rapport')
-check(p58_cleanupAt > p58_provStageAt,
-  'R58 — le nettoyage reste APRES la provenance (registerProvenance ecrit dans le workspace)')
-check(pipe.substring(p58_provStageAt).contains('finally'),
-  'R58 — le nettoyage est toujours dans un finally')
 
 println ''
 if (failures > 0) {

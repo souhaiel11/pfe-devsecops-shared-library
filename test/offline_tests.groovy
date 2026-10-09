@@ -448,17 +448,10 @@ Map captured = null
 def reporterStub = new Expando(buildPayload: { Map args -> shaReporter.buildPayload(args) },
     send: { Map result, Object base, Object build -> captured = result })
 def pipelineScript = this.class.classLoader.loadClass('devSecOpsPipeline').newInstance()
-// R57 -- acrPublisher est desormais un PARAMETRE de reportToPlatform (cf. la
-// classe de bug du build #9 : une methode ne capture pas les locales de call()).
-boolean provenanceAttempted = false
-def acrPublisherStub = new Expando(recordProvenance: { Object pub, Object a, Object w ->
-    provenanceAttempted = true
-})
+// R59 -- reportToPlatform ne prend plus acrPublisher : Jenkins n'enregistre
+// plus aucune provenance (ecrivain unique = la plateforme).
 pipelineScript.reportToPlatform(reportingScript, appTelemetry, cleanupStub, reporterStub,
-    acrPublisherStub,
     [isPR: false, checkoutFailed: false, zapStageEntered: false, applicationName: 'pfe-app-test'])
-check(!provenanceAttempted,
-    'R57 - rien n\'a ete publie : aucune provenance n\'est tentee')
 check(captured?.commitSha == applicationSha && captured?.commit == applicationSha.take(8),
     'SHA - real reportToPlatform forwards application telemetry despite different environment SHA')
 String producerSource = new File(System.getenv('LIB_ROOT'), 'vars/devSecOpsPipeline.groovy').text
@@ -468,74 +461,70 @@ check(producerSource.contains('def scmVars = checkout(scm)')
     && producerSource.contains('checkoutSha     : telemetry.checkoutFullSha'),
     'SHA - capture and forwarding remain tied to application checkout')
 
-// ---- R57: INVARIANT -- publication REQUISE dont la provenance echoue -------
-// On execute le VRAI reportToPlatform. L'image est publiee, l'enregistrement
-// de provenance echoue pour de bon : le build doit finir en FAILURE, sans que
-// le catch de reporting (volontairement non bloquant) ne l'absorbe.
-def invTelemetry = new StageTelemetry()
-invTelemetry.checkoutFullSha = applicationSha
-invTelemetry.checkoutShortSha = applicationSha.take(8)
-invTelemetry.docker.build_status = 'SUCCESS'
-invTelemetry.docker.push_status  = 'SUCCESS'
-invTelemetry.docker.published_tag = '10-' + applicationSha.take(12)
-invTelemetry.imagePublication = [published: true, tag: '10-' + applicationSha.take(12)]
+// ---- R59: Jenkins n'est PLUS un ecrivain de provenance ---------------------
+//
+// Build #10 a montre que faire attendre Jenkins la persistance de l'identite de
+// build par WF1 (104 s mesures) rend la correction dependante d'une course.
+// Elargir la fenetre ne corrige rien : on a donc retire l'ecrivain. La
+// plateforme enregistre la provenance, declenchee par cette persistance.
+//
+// Ce que Jenkins doit encore faire -- et uniquement cela : pousser l'image,
+// puis rapporter honnetement ses coordonnees avec provenance_status = PENDING.
+String r59Source = new File(System.getenv('LIB_ROOT'), 'vars/devSecOpsPipeline.groovy').text
+String r59Publisher = new File(System.getenv('LIB_ROOT'), 'src/org/pfe/devsecops/AcrPublisher.groovy').text
 
-def invBuild = [currentResult: 'SUCCESS', duration: 0]
-def invEchoes = []
-def invScript = new Expando(
-    env: [GIT_COMMIT: librarySha, GIT_BRANCH: 'origin/main', JOB_NAME: 'pfe-app-test', BUILD_NUMBER: '10'],
-    currentBuild: invBuild,
-    timeout: { Map options, Closure action -> action.call() },
-    echo: { Object message -> invEchoes << String.valueOf(message) })
-
-def invPipeline = this.class.classLoader.loadClass('devSecOpsPipeline').newInstance()
-// `stage` se resout sur l'instance de script dans Jenkins ; hors-ligne on le stub.
-boolean invStageEntered = false
-invPipeline.metaClass.stage = { Object name, Closure action ->
-    if (name == 'Record Image Provenance') { invStageEntered = true }
-    action.call()
+// ECRIVAIN UNIQUE : aucun appel de provenance ne subsiste cote pipeline.
+check(!r59Source.contains('recordProvenance'),
+    'R59 - le pipeline n\'appelle plus recordProvenance')
+check(!r59Source.contains("stage('Record Image Provenance')"),
+    'R59 - l\'etape Record Image Provenance a disparu du pipeline')
+check(!r59Publisher.contains('int registerProvenance('),
+    'R59 - registerProvenance a ete supprime (pas d\'ecrivain latent rebranchable)')
+check(!r59Publisher.contains('void recordProvenance('),
+    'R59 - recordProvenance a ete supprime')
+// On assertionne sur du CODE, pas sur la presence du mot : les deux fichiers
+// mentionnent encore l'endpoint dans des commentaires qui expliquent
+// precisement qui en est desormais proprietaire -- ce qui est voulu.
+def strippedCode = { String src ->
+    src.split('\n').findAll { String line ->
+        String s = line.trim()
+        !(s.startsWith('//') || s.startsWith('*') || s.startsWith('/*') || s.startsWith('#'))
+    }.join('\n')
 }
-def failingAcrPublisher = new Expando(recordProvenance: { Object pub, Object a, Object w ->
-    // ce que fait le vrai AcrPublisher : il pose le fait, puis echoue
-    invTelemetry.docker.provenance_status = 'FAILED'
-    throw new RuntimeException('ACR_PROVENANCE_REGISTRATION_FAILED: registration refused')
-})
-invPipeline.reportToPlatform(invScript, invTelemetry, cleanupStub, reporterStub,
-    failingAcrPublisher,
-    [isPR: false, checkoutFailed: false, zapStageEntered: false, applicationName: 'pfe-app-test'])
+check(!strippedCode(r59Publisher).contains('artifacts/provenance'),
+    'R59 - plus aucun appel a l\'endpoint de provenance depuis la bibliotheque')
+check(!strippedCode(r59Source).contains('artifacts/provenance'),
+    'R59 - ni depuis le pipeline : PROVENANCE_AUTOMATIC_WRITERS cote Jenkins = 0')
+// Garde-fou du garde-fou : la version non filtree DOIT encore contenir le mot,
+// sinon ces deux assertions passeraient pour la mauvaise raison.
+check(r59Publisher.contains('artifacts/provenance') || r59Source.contains('artifacts/provenance'),
+    'R59 - controle : le filtrage des commentaires est bien ce qui fait passer les deux assertions ci-dessus')
 
-check(invStageEntered, 'R57 - l\'etape Record Image Provenance a bien ete executee')
-check(invBuild.result == 'FAILURE',
-    'R57 - INVARIANT : provenance requise en echec => le build est FAILURE, pas SUCCESS')
-check(invTelemetry.docker.push_status == 'SUCCESS',
-    'R57 - le fait historique push_status = SUCCESS n\'est pas reecrit')
-check(invTelemetry.docker.provenance_status == 'FAILED',
-    'R57 - provenance_status = FAILED : deux faits distincts')
-check(invEchoes.any { it.contains('REQUIRED ARTIFACT CHAIN FAILED') },
-    'R57 - l\'echec est annonce comme un echec d\'artefact, pas comme un echec de reporting')
-check(!invEchoes.any { it.contains('Reporting failed (non-fatal') },
-    'R57 - l\'echec de provenance ne passe PAS par le catch non bloquant du reporting')
+// Aucune fenetre d'attente de provenance ne subsiste : plus rien a deviner.
+check(!r59Source.contains('TIMEOUT_PROVENANCE_MINUTES'),
+    'R59 - plus aucune fenetre d\'attente de provenance dans le pipeline')
 
-// Cas miroir : provenance OK => le build n'est pas marque en echec.
-def okBuild2 = [currentResult: 'SUCCESS', duration: 0]
-def okScript2 = new Expando(
-    env: [GIT_COMMIT: librarySha, GIT_BRANCH: 'origin/main', JOB_NAME: 'pfe-app-test', BUILD_NUMBER: '11'],
-    currentBuild: okBuild2,
-    timeout: { Map options, Closure action -> action.call() }, echo: { Object message -> })
-def okTelemetry = new StageTelemetry()
-okTelemetry.checkoutFullSha = applicationSha
-okTelemetry.docker.push_status = 'SUCCESS'
-okTelemetry.imagePublication = [published: true, tag: '11-' + applicationSha.take(12)]
-def okPipeline = this.class.classLoader.loadClass('devSecOpsPipeline').newInstance()
-okPipeline.metaClass.stage = { Object name, Closure action -> action.call() }
-okPipeline.reportToPlatform(okScript2, okTelemetry, cleanupStub, reporterStub,
-    new Expando(recordProvenance: { Object pub, Object a, Object w ->
-        okTelemetry.docker.provenance_status = 'SUCCESS' }),
-    [isPR: false, checkoutFailed: false, zapStageEntered: false, applicationName: 'pfe-app-test'])
-check(okBuild2.result == null,
-    'R57 - provenance OK : le resultat du build reste intact')
-check(okTelemetry.docker.provenance_status == 'SUCCESS',
-    'R57 - provenance OK : provenance_status = SUCCESS')
+// Ce que Jenkins CONSERVE : la publication, et un PENDING honnete.
+check(r59Publisher.contains("telemetry.docker.provenance_status = 'PENDING'"),
+    'R59 - une publication reussie laisse provenance_status = PENDING (publie, pas encore enregistre)')
+check(r59Publisher.contains('int pushImage(') && r59Source.contains('publishImage('),
+    'R59 - la publication de l\'image reste bien le travail de Jenkins')
+
+// PENDING n'est pas un echec : il ne doit jamais degrader le resultat du build
+// ni le fait historique du push.
+def r59Steps = new FakeSteps()
+def r59Tel = new StageTelemetry()
+r59Tel.docker.push_status = 'SUCCESS'
+r59Tel.docker.provenance_status = 'PENDING'
+check(r59Tel.docker.push_status == 'SUCCESS',
+    'R59 - push_status = SUCCESS coexiste avec provenance PENDING (deux faits distincts)')
+check(!(r59Source =~ /provenance[^\n]*currentBuild\.result/),
+    'R59 - un PENDING de provenance ne touche jamais le resultat du build')
+
+// Le catch de reporting reste, lui, deliberement non bloquant.
+check(r59Source.contains('Reporting failed (non-fatal, original build result preserved)'),
+    'R59 - la semantique non bloquante du reporting est inchangee')
+
 
 // ---- R80: publishSemanticTestEvidence() -- structured JUnit publication + raw testcase extraction ----
 def r80Steps = new FakeSteps()
