@@ -258,7 +258,34 @@ class AcrPublisher implements Serializable {
                       --max-time 30)
                     echo "provenance HTTP $CODE"
                     cat /tmp/acr_prov_resp.txt || true
-                    case "$CODE" in 2*) exit 0 ;; *) exit 1 ;; esac
+                    echo ""
+
+                    # R58 -- le code HTTP n'est PAS le verdict. NestJS @Post
+                    # repond 201 meme pour un refus ; le verdict est dans le
+                    # corps : {"status":"REJECTED","failureCode":"..."}.
+                    # Ne lire que le code fabriquait un succes (build #10).
+                    case "$CODE" in
+                      2*) ;;
+                      *)  echo "provenance: transport/HTTP failure ($CODE)" ; exit 1 ;;
+                    esac
+
+                    STATUS=$(sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\\([A-Za-z_]*\\)".*/\\1/p' /tmp/acr_prov_resp.txt | head -1)
+                    FCODE=$(sed -n 's/.*"failureCode"[[:space:]]*:[[:space:]]*"\\([A-Za-z_]*\\)".*/\\1/p' /tmp/acr_prov_resp.txt | head -1)
+                    echo "provenance verdict: status=${STATUS:-<none>} failureCode=${FCODE:-<none>}"
+
+                    # Seul PROVENANCE_VERIFIED est un enregistrement CI valide.
+                    # UNVERIFIED_MANUAL_ARTIFACT est le chemin manuel : l'accepter
+                    # depuis la CI degraderait la garantie.
+                    if [ "$STATUS" = "PROVENANCE_VERIFIED" ]; then exit 0; fi
+
+                    # Refus RATTRAPABLE : la plateforme n'a pas encore correle ce
+                    # build (l'incident WF1 existe, mais sa sourceCommitSha n'est
+                    # pas encore persistee). Seul cas ou reessayer a un sens.
+                    if [ "$STATUS" = "REJECTED" ] && [ "$FCODE" = "DEPLOY_COMMIT_MISSING" ]; then exit 2; fi
+
+                    # Tout le reste est TERMINAL (mismatch de commit, build,
+                    # repository, digest, revision) : reessayer n'y changera rien.
+                    exit 1
                 '''
             )
         }
@@ -385,8 +412,16 @@ class AcrPublisher implements Serializable {
                 last = registerProvenance(publication.target as Map, buildNumber,
                     publication.commitSha as String, publication.tag as String)
                 if (last == 0) { return 0 }
+                // R58 -- 2 = refus RATTRAPABLE (DEPLOY_COMMIT_MISSING : la
+                // plateforme n'a pas encore correle ce build). Tout autre code
+                // non nul est TERMINAL : on arrete tout de suite plutot que de
+                // consommer la fenetre entiere sur un refus definitif.
+                if (last != 2) {
+                    steps.echo "Provenance refused on terminal grounds (attempt ${i}/${total}); retrying cannot help."
+                    return last
+                }
                 if (i < total) {
-                    steps.echo "Provenance not recorded yet (attempt ${i}/${total}); the platform may not have ingested this build. Retrying."
+                    steps.echo "Provenance not recorded yet (attempt ${i}/${total}); the platform has not correlated this build yet. Retrying."
                     steps.sleep(time: waitSeconds, unit: 'SECONDS')
                 }
             }

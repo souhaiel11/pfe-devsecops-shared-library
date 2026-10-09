@@ -326,6 +326,7 @@ def applicationServiceName(String zapTargetUrl) {
 // « No such property: acrPublisher » -- exactement le defaut du build #9,
 // une couche plus haut.
 def reportToPlatform(script, telemetry, cleanup, reporter, acrPublisher, Map ctx) {
+  try {
     script.timeout(time: PlatformConfig.TIMEOUT_POST_REPORT_MINUTES, unit: 'MINUTES') {
         try {
             def env = script.env
@@ -523,41 +524,43 @@ def reportToPlatform(script, telemetry, cleanup, reporter, acrPublisher, Map ctx
 
             reporter.send(payloadObject, ctx.reportBase, currentBuild)
 
-            // R51 — enregistrement de provenance, APRES l'envoi du rapport.
-            //
-            // Le backend re-derive l'identite de build depuis l'incident que WF1
-            // cree a partir de CE rapport : appeler plus tot serait rejete pour
-            // tous les projets (DEPLOY_COMMIT_MISSING). L'ingestion etant
-            // asynchrone, recordProvenance reessaie dans une fenetre bornee.
-            //
-            // Un artefact publie mais non enregistre fait echouer le build : sous
-            // gouvernance il n'est pas deployable. Le push, lui, reste SUCCESS.
-            if (telemetry.imagePublication?.published == true) {
-                stage('Record Image Provenance') {
-                    try {
-                        acrPublisher.recordProvenance(telemetry.imagePublication, 6, 15)
-                    } catch (provenanceError) {
-                        // R57 — une chaine de publication REQUISE qui echoue doit se voir
-                        // dans le resultat du build. Le catch de reporting ci-dessous est
-                        // deliberement non bloquant pour la TELEMETRIE ; il ne doit jamais
-                        // absorber un echec d'ARTEFACT. On marque donc ici, sans relancer,
-                        // pour que ce catch ne le reclasse pas en « non-fatal ».
-                        //
-                        // Faits historiques preserves : push_status reste SUCCESS, et
-                        // provenance_status vaut FAILED (pose par recordProvenance avant
-                        // son erreur).
-                        script.currentBuild.result = 'FAILURE'
-                        script.echo "REQUIRED ARTIFACT CHAIN FAILED: image published but provenance not recorded -- ${provenanceError.message}"
-                    }
-                }
-            }
         } catch (ex) {
             // Reporting/cleanup must never mask the pipeline's real result
             // (Section 14) -- log and move on, never rethrow, never touch
             // currentBuild.result here.
             script.echo "Reporting failed (non-fatal, original build result preserved): ${ex.message}"
-        } finally {
-            cleanup.safeDeleteDir()
         }
     }
+
+    // R58 — la provenance est SORTIE de la fenetre de rapport, parce qu'elle
+    // attend un evenement qui arrive APRES l'envoi du rapport : la persistance
+    // de sourceCommitSha par WF1 (104 s au build #10, pour une fenetre de
+    // rapport de 120 s au total). Elle garde son propre budget, et le rapport
+    // garde son garde-fou de 2 min inchange.
+    //
+    // Elle reste AVANT cleanup.safeDeleteDir() : registerProvenance ecrit
+    // acr-provenance-request.json et a donc besoin du workspace.
+    if (telemetry.imagePublication?.published == true) {
+        try {
+            script.timeout(time: PlatformConfig.TIMEOUT_PROVENANCE_MINUTES, unit: 'MINUTES') {
+                stage('Record Image Provenance') {
+                    acrPublisher.recordProvenance(telemetry.imagePublication,
+                        PlatformConfig.PROVENANCE_ATTEMPTS, PlatformConfig.PROVENANCE_WAIT_SECONDS)
+                }
+            }
+        } catch (provenanceError) {
+            // R57 — une chaine de publication REQUISE qui echoue doit se voir dans
+            // le resultat du build. Le catch de reporting ci-dessus est
+            // deliberement non bloquant pour la TELEMETRIE ; il ne doit jamais
+            // absorber un echec d'ARTEFACT -- d'ou ce bloc separe.
+            //
+            // Faits historiques preserves : push_status reste SUCCESS, et
+            // provenance_status vaut FAILED (pose par recordProvenance).
+            script.currentBuild.result = 'FAILURE'
+            script.echo "REQUIRED ARTIFACT CHAIN FAILED: image published but provenance not recorded -- ${provenanceError.message}"
+        }
+    }
+  } finally {
+    cleanup.safeDeleteDir()
+  }
 }
