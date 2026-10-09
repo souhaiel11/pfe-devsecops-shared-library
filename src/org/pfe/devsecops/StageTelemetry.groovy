@@ -38,6 +38,19 @@ class StageTelemetry implements Serializable {
         digest             : null
     ]
 
+    /**
+     * R56 — resultat de l'etape de publication, porte par la TELEMETRIE et non
+     * par une variable locale du pipeline.
+     *
+     * Constate sur le build #9 reel : une locale typee declaree dans `node {}`
+     * mais affectee depuis la closure `withCredentials {}` n'est plus visible
+     * dans le bloc de rapport, et la reference echouait en
+     * « No such property: imagePublication ». L'etape de provenance ne tournait
+     * donc jamais. `telemetry` traverse deja toutes ces closures -- c'est le
+     * seul porteur fiable.
+     */
+    Map imagePublication = [published: false]
+
     Map sonar = [ceTaskId: null, analysisId: null]
 
     Map tests = [status: 'UNKNOWN', total: null, failures: null, skipped: null, coverage: null]

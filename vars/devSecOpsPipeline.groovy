@@ -99,10 +99,9 @@ def call(Closure body = null) {
             boolean checkoutFailed = false
             boolean zapStageEntered = false
             boolean dockerfilePresent = false
-            // R51 — resultat de l'etape de publication, consomme apres l'envoi du
-            // rapport : l'enregistrement de provenance ne peut pas avoir lieu avant
-            // que la plateforme ait ingere ce build (voir recordProvenance).
-            Map imagePublication = [published: false]
+            // R56 — le resultat de publication voyage par telemetry.imagePublication,
+            // jamais par une locale : une locale affectee dans la closure
+            // withCredentials n'est pas visible depuis le bloc de rapport (build #9).
 
             withCredentials([
                 string(credentialsId: PlatformConfig.CRED_SONAR_TOKEN, variable: 'SONAR_TOKEN'),
@@ -214,7 +213,7 @@ def call(Closure body = null) {
                         if (PlatformConfig.ACR_PUBLISH_ENABLED && dockerfilePresent && !isPR
                                 && telemetry.docker.build_status == 'SUCCESS') {
                             stage('Publish Image (ACR)') {
-                                imagePublication = acrPublisher.publishImage(
+                                acrPublisher.publishImage(
                                     jobName       : env.JOB_NAME,
                                     imageName     : imageName,
                                     imageTag      : imageTag,
@@ -528,9 +527,9 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
             //
             // Un artefact publie mais non enregistre fait echouer le build : sous
             // gouvernance il n'est pas deployable. Le push, lui, reste SUCCESS.
-            if (imagePublication?.published == true) {
+            if (telemetry.imagePublication?.published == true) {
                 stage('Record Image Provenance') {
-                    acrPublisher.recordProvenance(imagePublication, 6, 15)
+                    acrPublisher.recordProvenance(telemetry.imagePublication, 6, 15)
                 }
             }
         } catch (ex) {

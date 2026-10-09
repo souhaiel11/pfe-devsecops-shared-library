@@ -338,7 +338,10 @@ class AcrPublisher implements Serializable {
         telemetry.docker.provenance_status = 'PENDING'
         // digest stays null here: the backend resolves it authoritatively.
         steps.echo "Image published: ${telemetry.docker.published_reference} (provenance registration deferred until the platform has ingested this build)"
-        return [published: true, target: target, tag: tag, commitSha: commitSha, buildNumber: imageTag]
+        Map result = [published: true, target: target, tag: tag, commitSha: commitSha, buildNumber: imageTag]
+        // Porte par la telemetrie : voir StageTelemetry.imagePublication.
+        telemetry.imagePublication = result
+        return result
     }
 
     /** One place for "not configured" vs "you asked for this, so it must work". */
@@ -348,6 +351,7 @@ class AcrPublisher implements Serializable {
             steps.error("ACR_PUBLISH_REQUIRED_BUT_UNAVAILABLE (${reason}): this project asked for image publication but ${explanation}. Configure it -- nothing is ever chosen on the project's behalf.")
         }
         telemetry.docker.push_status = 'NOT_CONFIGURED'
+        telemetry.imagePublication = [published: false, reason: reason]
         steps.echo "ACR publication skipped (${reason}): ${explanation}. No registry or credential is assumed on the project's behalf."
         return [published: false, reason: reason]
     }

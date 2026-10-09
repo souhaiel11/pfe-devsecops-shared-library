@@ -369,6 +369,43 @@ int publishIdx = pipeline.indexOf('acrPublisher.publishImage(')
 check(publishIdx > 0 && publishIdx < sendIdx,
     'SEQUENCE — le push a lieu avant le rapport, pour que ses faits y figurent')
 
+// ════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// 10. R56 — le resultat de publication voyage par la TELEMETRIE
+// Defaut reel du build #9 : une locale typee affectee dans la closure
+// withCredentials n'etait plus visible dans le bloc de rapport, et l'etape de
+// provenance ne tournait jamais (« No such property: imagePublication »).
+// ════════════════════════════════════════════════════════════════════════════
+def st = stepsWith(['internal/by-job': projectJson, 'image inspect': SHA + '\n'], [])
+def tp = new StageTelemetry(); tp.checkoutFullSha = SHA
+check(tp.imagePublication?.published == false,
+  'TELEMETRIE — imagePublication part d\'un etat non publie')
+def res = new AcrPublisher(st, tp).publishImage(jobName: 'my-app', imageName: 'my-app', imageTag: '8')
+check(tp.imagePublication?.published == true,
+  'TELEMETRIE — une publication reussie est portee par telemetry, pas par une locale')
+check(tp.imagePublication?.tag == res.tag && tp.imagePublication?.commitSha == SHA,
+  'TELEMETRIE — telemetry porte le meme resultat que la valeur retournee')
+
+// Projet sans registre : la telemetrie dit explicitement « non publie ».
+def st2 = stepsWith(['internal/by-job': noAcrJson], [])
+def tp2 = new StageTelemetry(); tp2.checkoutFullSha = SHA
+new AcrPublisher(st2, tp2).publishImage(jobName: 'x', imageName: 'x', imageTag: '3')
+check(tp2.imagePublication?.published == false,
+  'TELEMETRIE — un projet sans registre reste non publie dans la telemetrie')
+check(tp2.imagePublication?.reason != null,
+  'TELEMETRIE — le motif accompagne l\'absence de publication')
+
+// Le pipeline doit LIRE la telemetrie, et ne plus declarer de locale.
+String pipe = new File("${System.getenv('LIB_ROOT') ?: '.'}/vars/devSecOpsPipeline.groovy").text
+check(pipe.contains('telemetry.imagePublication?.published == true'),
+  'PIPELINE — la garde lit telemetry.imagePublication')
+check(pipe.contains('recordProvenance(telemetry.imagePublication'),
+  'PIPELINE — recordProvenance recoit la valeur portee par telemetry')
+check(!(pipe =~ /Map imagePublication\s*=/),
+  'PIPELINE — plus aucune locale imagePublication (invisible depuis le bloc de rapport)')
+check(!(pipe =~ /\n\s+imagePublication\s*=\s*acrPublisher/),
+  'PIPELINE — plus aucune affectation de locale depuis la closure withCredentials')
+
 println ''
 if (failures > 0) {
     println "ACR PUBLISHER TESTS: ${failures} echec(s)"
