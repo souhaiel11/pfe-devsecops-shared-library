@@ -17,7 +17,26 @@ class StageTelemetry implements Serializable {
 
     Map<String, String> buildStageStatus = [:]
 
-    Map docker = [build_status: 'UNKNOWN', image_tag: null, push_status: 'NOT_ATTEMPTED']
+    // R50 — construction, publication et provenance sont trois faits distincts,
+    // donc trois champs distincts. Tous partent d'un etat honnete :
+    //   build_status      UNKNOWN        l'etape n'a rien dit encore
+    //   push_status       NOT_ATTEMPTED  rien n'a ete pousse
+    //   provenance_status NOT_ATTEMPTED  rien n'a ete enregistre
+    // Les coordonnees publiees restent nulles tant que le registre n'a pas
+    // confirme : registry/repository/published_tag/digest ne sont jamais
+    // deduits de la configuration, seulement du resultat du push.
+    // Aucun champ « deployed » ici : ce pipeline n'observe aucun deploiement.
+    Map docker = [
+        build_status       : 'UNKNOWN',
+        image_tag          : null,
+        push_status        : 'NOT_ATTEMPTED',
+        provenance_status  : 'NOT_ATTEMPTED',
+        registry           : null,
+        repository         : null,
+        published_tag      : null,
+        published_reference: null,
+        digest             : null
+    ]
 
     Map sonar = [ceTaskId: null, analysisId: null]
 

@@ -53,6 +53,15 @@ class FakeSteps {
 
     def echo(String msg) { echoed << msg }
 
+    /** R50 — captures what the publication stage would have written to disk. */
+    Map<String, String> writtenFiles = [:]
+    def writeFile(Map args) {
+        writtenFiles[(args.file ?: '').toString()] = (args.text ?: '').toString()
+        return null
+    }
+
+    def sleep(Map args) { return null }
+
     def error(String msg) { throw new RuntimeException(msg) }
 
     def fileExists(String path) { false }

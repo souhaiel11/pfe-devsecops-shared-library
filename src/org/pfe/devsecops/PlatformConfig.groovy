@@ -17,6 +17,10 @@ class PlatformConfig implements Serializable {
     static final String CRED_SONAR_TOKEN = 'SONAR_TOKEN'
     static final String CRED_N8N_API_KEY = 'N8N_API_KEY'
     static final String CRED_NVD_API_KEY = 'NVD_API_KEY'
+    // Publication ACR (R50). Identifiants de la PLATEFORME, jamais par projet :
+    // tous les projets poussent vers le meme registre, chacun dans SON depot.
+    static final String CRED_ACR = 'ACR_CREDENTIALS'                 // usernamePassword
+    static final String CRED_INTERNAL_SECRET = 'N8N_INTERNAL_SECRET' // string
 
     // ---- SonarQube ----
     static final String SONAR_ENV_NAME = 'sq1'          // withSonarQubeEnv() name configured in Jenkins
@@ -49,6 +53,9 @@ class PlatformConfig implements Serializable {
     static final boolean TRIVY_ENABLED = true
     static final boolean OWASP_ENABLED = true
     static final boolean ZAP_ENABLED_ON_BRANCH_BUILDS = true // never on PR builds
+    // Publier l'image dans l'ACR du projet. Un projet sans azureConfig reste
+    // NOT_CONFIGURED -- aucun registre n'est choisi a sa place.
+    static final boolean ACR_PUBLISH_ENABLED = true
 
     // ---- Default governance-neutral gate (Jenkins never enforces by default) ----
     static final boolean DEFAULT_JENKINS_HARD_GATE = false

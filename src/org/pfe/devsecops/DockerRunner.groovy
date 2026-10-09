@@ -1,6 +1,14 @@
 package org.pfe.devsecops
 
-/** PIPELINE_GENERIC Docker image build. No push -- this platform never pushes from Jenkins. */
+/**
+ * PIPELINE_GENERIC Docker image build.
+ *
+ * This class still never pushes: building and publishing are separate stages
+ * with separate failure modes. It leaves push_status at NOT_ATTEMPTED, which
+ * stays the honest value for a build whose publication stage never ran (no ACR
+ * configured, or publication disabled). AcrPublisher owns the push and
+ * overwrites that state only once a real push happened.
+ */
 class DockerRunner implements Serializable {
 
     private final def steps
@@ -51,8 +59,9 @@ class DockerRunner implements Serializable {
                 telemetry.docker.build_status = 'SUCCESS'
                 telemetry.buildStageStatus['docker'] = 'SUCCESS'
             }
-            // No `docker push` in this pipeline -- honest value, never a fabricated
-            // SUCCESS/UNKNOWN for a step that was never attempted.
+            // Not pushed BY THIS CLASS -- honest value, never a fabricated
+            // SUCCESS/UNKNOWN for a step that was never attempted. AcrPublisher
+            // replaces it with SUCCESS/FAILED/NOT_CONFIGURED when it runs.
             telemetry.docker.push_status = 'NOT_ATTEMPTED'
         }
     }

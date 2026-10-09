@@ -3,6 +3,7 @@ import org.pfe.devsecops.ProjectDetector
 import org.pfe.devsecops.StageTelemetry
 import org.pfe.devsecops.BuildRunner
 import org.pfe.devsecops.DockerRunner
+import org.pfe.devsecops.AcrPublisher
 import org.pfe.devsecops.ScannerRunner
 import org.pfe.devsecops.PlatformReporter
 import org.pfe.devsecops.SafeCleanup
@@ -70,6 +71,7 @@ def call(Closure body = null) {
             def detector = new ProjectDetector(this)
             def buildRunner = new BuildRunner(this, telemetry)
             def dockerRunner = new DockerRunner(this, telemetry)
+            def acrPublisher = new AcrPublisher(this, telemetry)
             def scanners = new ScannerRunner(this, telemetry)
             def reporter = new PlatformReporter(this)
             def cleanup = new SafeCleanup(this)
@@ -101,7 +103,12 @@ def call(Closure body = null) {
             withCredentials([
                 string(credentialsId: PlatformConfig.CRED_SONAR_TOKEN, variable: 'SONAR_TOKEN'),
                 string(credentialsId: PlatformConfig.CRED_N8N_API_KEY, variable: 'N8N_API_KEY'),
-                string(credentialsId: PlatformConfig.CRED_NVD_API_KEY, variable: 'NVD_API_KEY')
+                string(credentialsId: PlatformConfig.CRED_NVD_API_KEY, variable: 'NVD_API_KEY'),
+                // R50 — publication ACR + enregistrement de provenance. Les deux
+                // valeurs ne quittent jamais l'environnement : aucun script de
+                // cette bibliotheque ne les interpole dans son texte.
+                string(credentialsId: PlatformConfig.CRED_INTERNAL_SECRET, variable: 'N8N_INTERNAL_SECRET'),
+                usernamePassword(credentialsId: PlatformConfig.CRED_ACR, usernameVariable: 'ACR_USERNAME', passwordVariable: 'ACR_PASSWORD')
             ]) {
                 stage('Init') {
                     env.PATH = "${tool 'M3'}/bin:${env.PATH}"
@@ -184,6 +191,30 @@ def call(Closure body = null) {
                         if (dockerfilePresent) {
                             stage('Docker Build') {
                                 dockerRunner.build(imageName, imageTag, config.dockerfile, workingDirectory)
+                            }
+                        }
+
+                        // R50 — publication de l'image de CETTE execution dans l'ACR du
+                        // projet, puis enregistrement de sa provenance.
+                        //
+                        // Jamais sur un build de PR : une PR n'est pas un artefact
+                        // deployable, et la publier polluerait le depot d'images avec des
+                        // propositions. Jamais non plus si l'etape Docker n'a pas reussi :
+                        // il n'y aurait rien a publier.
+                        //
+                        // Cette etape FAIT ECHOUER le build si la publication ou
+                        // l'enregistrement echoue pour un projet qui a un ACR configure.
+                        // Elle ne declare jamais l'image deployee.
+                        if (PlatformConfig.ACR_PUBLISH_ENABLED && dockerfilePresent && !isPR
+                                && telemetry.docker.build_status == 'SUCCESS') {
+                            stage('Publish Image (ACR)') {
+                                acrPublisher.publish(
+                                    jobName       : env.JOB_NAME,
+                                    imageName     : imageName,
+                                    imageTag      : imageTag,
+                                    requirePublish: config.containsKey('requireImagePublication')
+                                                        ? config.requireImagePublication : false
+                                )
                             }
                         }
 
@@ -431,7 +462,18 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                     image       : "${ctx.imageName}:${ctx.imageTag}",
                     build_status: telemetry.docker.build_status,
                     image_tag   : telemetry.docker.image_tag,
-                    push_status : telemetry.docker.push_status
+                    push_status : telemetry.docker.push_status,
+                    // R50 — faits de PUBLICATION, additifs a cote du statut de
+                    // construction. Nuls tant que le registre n'a rien confirme :
+                    // ils ne sont jamais deduits de la configuration du projet.
+                    // Aucun champ « deployed » : publier n'est pas deployer, et ce
+                    // pipeline n'observe aucun deploiement.
+                    provenance_status  : telemetry.docker.provenance_status,
+                    registry           : telemetry.docker.registry,
+                    repository         : telemetry.docker.repository,
+                    published_tag      : telemetry.docker.published_tag,
+                    published_reference: telemetry.docker.published_reference,
+                    digest             : telemetry.docker.digest
                 ],
                 // R46 -- diagnostics factuels d'OWASP, additifs a cote du drapeau
                 // reports.available.owasp que WF1 consomme deja. Jenkins enonce des
