@@ -99,16 +99,22 @@ def call(Closure body = null) {
             boolean checkoutFailed = false
             boolean zapStageEntered = false
             boolean dockerfilePresent = false
+            // R51 — resultat de l'etape de publication, consomme apres l'envoi du
+            // rapport : l'enregistrement de provenance ne peut pas avoir lieu avant
+            // que la plateforme ait ingere ce build (voir recordProvenance).
+            Map imagePublication = [published: false]
 
             withCredentials([
                 string(credentialsId: PlatformConfig.CRED_SONAR_TOKEN, variable: 'SONAR_TOKEN'),
                 string(credentialsId: PlatformConfig.CRED_N8N_API_KEY, variable: 'N8N_API_KEY'),
-                string(credentialsId: PlatformConfig.CRED_NVD_API_KEY, variable: 'NVD_API_KEY'),
-                // R50 — publication ACR + enregistrement de provenance. Les deux
-                // valeurs ne quittent jamais l'environnement : aucun script de
-                // cette bibliotheque ne les interpole dans son texte.
-                string(credentialsId: PlatformConfig.CRED_INTERNAL_SECRET, variable: 'N8N_INTERNAL_SECRET'),
-                usernamePassword(credentialsId: PlatformConfig.CRED_ACR, usernameVariable: 'ACR_USERNAME', passwordVariable: 'ACR_PASSWORD')
+                string(credentialsId: PlatformConfig.CRED_NVD_API_KEY, variable: 'NVD_API_KEY')
+                // R51 — les identifiants de PUBLICATION ne sont deliberement PAS
+                // lies ici. Les lier globalement faisait echouer TOUT projet des
+                // qu'ils manquaient, y compris ceux qui n'ont aucun ACR configure
+                // et n'ont jamais demande a publier. AcrPublisher les acquiert
+                // lui-meme, dans le chemin exact qui les utilise :
+                //   N8N_INTERNAL_SECRET  lecture de la config projet, puis POST provenance
+                //   ACR_CREDENTIALS      le push, et seulement une fois un registre connu
             ]) {
                 stage('Init') {
                     env.PATH = "${tool 'M3'}/bin:${env.PATH}"
@@ -208,7 +214,7 @@ def call(Closure body = null) {
                         if (PlatformConfig.ACR_PUBLISH_ENABLED && dockerfilePresent && !isPR
                                 && telemetry.docker.build_status == 'SUCCESS') {
                             stage('Publish Image (ACR)') {
-                                acrPublisher.publish(
+                                imagePublication = acrPublisher.publishImage(
                                     jobName       : env.JOB_NAME,
                                     imageName     : imageName,
                                     imageTag      : imageTag,
@@ -512,6 +518,21 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
             }
 
             reporter.send(payloadObject, ctx.reportBase, currentBuild)
+
+            // R51 — enregistrement de provenance, APRES l'envoi du rapport.
+            //
+            // Le backend re-derive l'identite de build depuis l'incident que WF1
+            // cree a partir de CE rapport : appeler plus tot serait rejete pour
+            // tous les projets (DEPLOY_COMMIT_MISSING). L'ingestion etant
+            // asynchrone, recordProvenance reessaie dans une fenetre bornee.
+            //
+            // Un artefact publie mais non enregistre fait echouer le build : sous
+            // gouvernance il n'est pas deployable. Le push, lui, reste SUCCESS.
+            if (imagePublication?.published == true) {
+                stage('Record Image Provenance') {
+                    acrPublisher.recordProvenance(imagePublication, 6, 15)
+                }
+            }
         } catch (ex) {
             // Reporting/cleanup must never mask the pipeline's real result
             // (Section 14) -- log and move on, never rethrow, never touch

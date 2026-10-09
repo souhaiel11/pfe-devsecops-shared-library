@@ -53,6 +53,32 @@ class FakeSteps {
 
     def echo(String msg) { echoed << msg }
 
+    /**
+     * R51 — credential binding. `missingCredentialIds` simulates a credential
+     * that does not exist on the controller, which is exactly what Jenkins does
+     * (CredentialNotFoundException). `requestedCredentialIds` records which ones
+     * were asked for, so a test can prove an unconfigured project never requests
+     * a publication credential at all.
+     */
+    Set<String> missingCredentialIds = [] as Set
+    List<String> requestedCredentialIds = []
+
+    def string(Map args) { [kind: 'string', id: args.credentialsId, variable: args.variable] }
+    def usernamePassword(Map args) {
+        [kind: 'usernamePassword', id: args.credentialsId,
+         usernameVariable: args.usernameVariable, passwordVariable: args.passwordVariable]
+    }
+    def withCredentials(List bindings, Closure body) {
+        bindings.each { b ->
+            String id = String.valueOf(b instanceof Map ? b.id : b)
+            requestedCredentialIds << id
+            if (missingCredentialIds.contains(id)) {
+                throw new RuntimeException("Could not find credentials entry with ID '${id}'")
+            }
+        }
+        return body.call()
+    }
+
     /** R50 — captures what the publication stage would have written to disk. */
     Map<String, String> writtenFiles = [:]
     def writeFile(Map args) {

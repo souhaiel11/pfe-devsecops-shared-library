@@ -2,28 +2,48 @@ package org.pfe.devsecops
 
 /**
  * PIPELINE_GENERIC publication of THIS execution's image to the project's own
- * ACR repository, followed by provenance registration in the platform.
+ * ACR repository, and registration of its provenance in the platform.
  *
  * Three boundaries this class refuses to blur:
  *
  *   built  != published   a local image is not in a registry
  *   published != deployed  a registry manifest is not a running container
- *   claimed != resolved    the digest this pipeline reports is a CLAIM; the
- *                          backend independently resolves it from ACR and may
- *                          disagree, which is the point of sending it.
+ *   pushed != recorded     a push that happened stays true even when the
+ *                          platform then refuses to record it
  *
- * Identity discipline. The artifact is addressed by the EXACT reference this
- * run built -- never by listing `docker images`, never by `latest`, never by
- * "most recent". On top of that, the image's own
- * org.opencontainers.image.revision label must equal this run's commit before
- * anything is pushed: two builds of the same branch produce the same
- * `name:BUILD_NUMBER` shape, and a stale local image would otherwise be
- * publishable under a fresh build's tag. The label check is what makes the
- * published artifact provably this execution's.
+ * -- Identity discipline --
+ * The artifact is addressed by the EXACT reference this run built -- never by
+ * listing `docker images`, never by `latest`, never by "most recent". On top of
+ * that, the image's own org.opencontainers.image.revision label must equal this
+ * run's full 40-character commit before anything is pushed: two builds of the
+ * same branch produce the same `name:BUILD_NUMBER` shape, so a stale local
+ * image would otherwise be publishable under a fresh build's tag.
  *
- * No credential value is ever interpolated into a script. Every secret is read
- * from the environment inside single-quoted shell, exactly as PlatformReporter
- * already does.
+ * -- Digest resolution: BACKEND_AGENT --
+ * This pipeline does NOT resolve the registry digest. Qualification of the real
+ * Jenkins execution context found no `az` binary and therefore no Azure session
+ * there, and adding a second Azure authentication model to Jenkins would be a
+ * fragile duplicate of one that already works. The backend already owns that
+ * path (/artifacts/provenance -> agent /resolve-digest ->
+ * `az acr repository show`) and is authoritative over the digest.
+ *
+ * So no digest is claimed here. The DTO makes it optional precisely so a caller
+ * that cannot address the registry authoritatively says nothing rather than
+ * guessing. Pushing needs only `docker login` -- no Azure CLI.
+ *
+ * -- Credential scope --
+ * No credential is bound globally. A project with no ACR configuration must
+ * build normally without any publication credential existing at all, so each
+ * secret is acquired inside the narrowest path that actually uses it:
+ *
+ *   N8N_INTERNAL_SECRET  the project-config lookup, and the provenance POST
+ *   ACR_CREDENTIALS      the push, and only once a registry is known
+ *
+ * A missing credential degrades to NOT_CONFIGURED for a project that never
+ * asked to publish, and fails closed for one that did (requirePublish).
+ *
+ * No credential value is ever interpolated into a script: every secret is read
+ * from the environment inside single-quoted shell, as PlatformReporter does.
  */
 class AcrPublisher implements Serializable {
 
@@ -41,62 +61,93 @@ class AcrPublisher implements Serializable {
     private static final String REGISTRY_PATTERN = /[A-Za-z0-9][A-Za-z0-9.-]{0,252}/
 
     /**
-     * Immutable-by-construction tag for a build: the build number carries
-     * ordering, the commit prefix carries identity. Neither alone is enough --
-     * a build number is reused across rebuilds of a re-created job, and a
-     * commit is reused across rebuilds of the same commit.
+     * Immutable-by-construction tag: the build number carries ordering, the
+     * commit prefix carries identity. Neither alone is enough -- a build number
+     * repeats when a job is recreated, a commit repeats across rebuilds of the
+     * same commit.
      *
-     * Deliberately NOT `latest`, and never a bare build number: the whole point
-     * is that the published tag names one execution and nothing else.
+     * The 12-character prefix is a REFERENCE for humans and registries. The
+     * authoritative commit in provenance is always the full 40-character sha
+     * sent as `commitSha`, which the backend re-derives independently anyway.
+     *
+     * Deliberately not `latest`, and never a bare build number.
      */
     static String publishTag(String buildNumber, String commitSha) {
         String build = (buildNumber ?: '').trim()
         String sha = (commitSha ?: '').trim()
-        if (!(build ==~ /\d{1,24}/)) {
-            return null
-        }
-        if (!(sha ==~ /[a-fA-F0-9]{40}/)) {
-            return null
-        }
+        if (!(build ==~ /\d{1,24}/)) { return null }
+        if (!(sha ==~ /[a-fA-F0-9]{40}/)) { return null }
         return "${build}-${sha.substring(0, 12).toLowerCase()}"
     }
 
     /**
-     * The project's own ACR coordinates, read from the platform record.
-     * Returns a reason instead of a guess when anything is missing: picking a
-     * registry on the project's behalf is exactly the failure this must avoid.
+     * The project's own ACR coordinates. Returns a reason instead of a guess
+     * when anything is missing: choosing a registry on the project's behalf is
+     * exactly the failure this must avoid.
      */
     static Map resolveTarget(Map project) {
-        if (!project) {
-            return [ok: false, reason: 'PROJECT_RECORD_UNAVAILABLE']
-        }
+        if (!project) { return [ok: false, reason: 'PROJECT_RECORD_UNAVAILABLE'] }
         def azure = project.azureConfig
-        if (!(azure instanceof Map) || !azure) {
-            return [ok: false, reason: 'ACR_NOT_CONFIGURED']
-        }
+        if (!(azure instanceof Map) || !azure) { return [ok: false, reason: 'ACR_NOT_CONFIGURED'] }
         String registry = (azure.registry ?: '').toString().trim()
         String repository = (azure.imageRepository ?: '').toString().trim()
         String projectId = (project.id ?: '').toString().trim()
-        if (!registry || !repository) {
-            return [ok: false, reason: 'ACR_NOT_CONFIGURED']
-        }
-        if (!(registry ==~ REGISTRY_PATTERN)) {
-            return [ok: false, reason: 'ACR_REGISTRY_INVALID']
-        }
-        if (!(repository ==~ REPOSITORY_PATTERN)) {
-            return [ok: false, reason: 'ACR_REPOSITORY_INVALID']
-        }
-        if (!(projectId ==~ /[0-9a-fA-F-]{36}/)) {
-            return [ok: false, reason: 'PROJECT_ID_UNAVAILABLE']
-        }
+        if (!registry || !repository) { return [ok: false, reason: 'ACR_NOT_CONFIGURED'] }
+        if (!(registry ==~ REGISTRY_PATTERN)) { return [ok: false, reason: 'ACR_REGISTRY_INVALID'] }
+        if (!(repository ==~ REPOSITORY_PATTERN)) { return [ok: false, reason: 'ACR_REPOSITORY_INVALID'] }
+        if (!(projectId ==~ /[0-9a-fA-F-]{36}/)) { return [ok: false, reason: 'PROJECT_ID_UNAVAILABLE'] }
         return [ok: true, registry: registry, repository: repository, projectId: projectId]
     }
 
     /**
-     * Resolves the platform's record for this Jenkins job. The pipeline knows
-     * its job name, never a project UUID, so this is the generic lookup --
-     * onboarding a project requires no pipeline change.
+     * Runs `body` with the platform's internal secret bound, or reports that
+     * the credential does not exist on this controller. Never lets a missing
+     * publication credential break a project that does not publish.
      */
+    private Map withInternalSecret(Closure body) {
+        try {
+            def out = steps.withCredentials([
+                steps.string(credentialsId: PlatformConfig.CRED_INTERNAL_SECRET, variable: 'N8N_INTERNAL_SECRET')
+            ]) { body.call() }
+            return [ok: true, value: out]
+        } catch (err) {
+            if (isCredentialMissing(err)) {
+                return [ok: false, credentialMissing: true, reason: 'INTERNAL_SECRET_UNAVAILABLE']
+            }
+            throw err
+        }
+    }
+
+    /** Same, for the ACR username/password -- bound only once a registry is known. */
+    private Map withAcrCredentials(Closure body) {
+        try {
+            def out = steps.withCredentials([
+                steps.usernamePassword(credentialsId: PlatformConfig.CRED_ACR,
+                    usernameVariable: 'ACR_USERNAME', passwordVariable: 'ACR_PASSWORD')
+            ]) { body.call() }
+            return [ok: true, value: out]
+        } catch (err) {
+            if (isCredentialMissing(err)) {
+                return [ok: false, credentialMissing: true, reason: 'ACR_CREDENTIALS_UNAVAILABLE']
+            }
+            throw err
+        }
+    }
+
+    /**
+     * A credential that does not exist is a configuration state, not a crash.
+     * Anything else -- a real push failure, a network error -- keeps
+     * propagating: this must never become a catch-all.
+     */
+    private static boolean isCredentialMissing(Throwable err) {
+        String message = String.valueOf(err?.message ?: '')
+        String type = err?.getClass()?.getName() ?: ''
+        return type.contains('CredentialNotFoundException') ||
+               message.contains('Could not find credentials') ||
+               message.contains('could not find any unique credentials')
+    }
+
+    /** The platform's record for this Jenkins job. Requires the internal secret. */
     Map fetchProject(String jobName) {
         String response = steps.withEnv([
             "PFE_BACKEND_URL=${PlatformConfig.BACKEND_URL}",
@@ -113,21 +164,17 @@ class AcrPublisher implements Serializable {
             )
         }
         def parsed = new groovy.json.JsonSlurperClassic().parseText((response ?: '[]').trim())
-        // The route answers with a list (exact match, then short-name fallback).
-        if (parsed instanceof List) {
-            return parsed ? (parsed[0] as Map) : null
-        }
+        if (parsed instanceof List) { return parsed ? (parsed[0] as Map) : null }
         return parsed instanceof Map ? (parsed as Map) : null
     }
 
     /**
-     * Verifies that the local reference really is the image this run produced,
-     * by reading the OCI revision label off that exact reference.
+     * Verifies the local reference really is the image this run produced, by
+     * reading the OCI revision label off that exact reference.
      *
      * `docker image inspect <ref>` addresses one image; it is not a listing and
-     * cannot drift to another tag. A missing image, a missing label or a label
-     * that disagrees with this run's commit are all refusals -- never a
-     * best-effort push of whatever happens to be lying around.
+     * cannot drift to another tag. A missing image, a missing label, or a label
+     * disagreeing with this run's commit are all refusals.
      */
     Map verifyLocalImage(String localRef, String expectedSha) {
         if (!localRef || !(expectedSha ==~ /[a-fA-F0-9]{40}/)) {
@@ -144,9 +191,7 @@ class AcrPublisher implements Serializable {
             )
         }
         String actual = (label ?: '').trim()
-        if (!actual) {
-            return [ok: false, reason: 'LOCAL_IMAGE_REVISION_LABEL_MISSING']
-        }
+        if (!actual) { return [ok: false, reason: 'LOCAL_IMAGE_REVISION_LABEL_MISSING'] }
         if (!actual.equalsIgnoreCase(expectedSha)) {
             return [ok: false, reason: 'LOCAL_IMAGE_REVISION_MISMATCH', found: actual]
         }
@@ -154,26 +199,19 @@ class AcrPublisher implements Serializable {
     }
 
     /**
-     * Pushes the verified local image under its unique tag and returns the
-     * digest ACR itself reports for it.
-     *
-     * The digest is read back FROM THE REGISTRY, not from the local daemon,
-     * using the SAME read-only command the platform's Azure agent already uses
-     * in /resolve-digest (`az acr repository show --image repo:tag`). What the
-     * registry stored is the only digest that can be deployed later, and a local
-     * RepoDigest can be absent or stale.
+     * Tags the verified local image with its unique tag and pushes it.
+     * Needs only `docker login` -- no Azure CLI, so no second Azure auth model
+     * in Jenkins. Returns the shell status; nonzero is a real failure.
      */
-    String pushAndResolveDigest(Map target, String localRef, String tag) {
+    int pushImage(Map target, String localRef, String tag) {
         String remoteRef = "${target.registry}.azurecr.io/${target.repository}:${tag}"
-        String digest = steps.withEnv([
+        return steps.withEnv([
             "PFE_LOCAL_REF=${localRef}",
             "PFE_REMOTE_REF=${remoteRef}",
-            "PFE_REGISTRY=${target.registry}",
-            "PFE_REPOSITORY=${target.repository}",
-            "PFE_TAG=${tag}"
+            "PFE_REGISTRY=${target.registry}"
         ]) {
             steps.sh(
-                returnStdout: true,
+                returnStatus: true,
                 script: '''
                     set -e
                     # Credentials arrive only through the environment; they are
@@ -181,39 +219,29 @@ class AcrPublisher implements Serializable {
                     echo "$ACR_PASSWORD" | docker login "$PFE_REGISTRY.azurecr.io" \
                       --username "$ACR_USERNAME" --password-stdin >/dev/null 2>&1
                     docker tag "$PFE_LOCAL_REF" "$PFE_REMOTE_REF"
-                    docker push "$PFE_REMOTE_REF" >&2
-                    # The registry's own answer, not the local daemon's.
-                    # Deliberately the SAME read-only command the platform's
-                    # Azure agent already uses in /resolve-digest
-                    # (az acr repository show --image repo:tag), so the digest
-                    # this pipeline claims and the one the backend resolves come
-                    # from one command, not two that could diverge.
-                    az acr repository show -n "$PFE_REGISTRY" \
-                      --image "$PFE_REPOSITORY:$PFE_TAG" --query digest -o tsv
+                    docker push "$PFE_REMOTE_REF"
+                    docker logout "$PFE_REGISTRY.azurecr.io" >/dev/null 2>&1 || true
                 '''
             )
         }
-        String resolved = (digest ?: '').trim()
-        return resolved ==~ /sha256:[a-f0-9]{64}/ ? resolved : null
     }
 
     /**
      * Records provenance through the platform's existing CI contract
      * (POST /api/azure-deploy/artifacts/provenance, RegisterArtifactDto).
      *
-     * No new endpoint and no new field: the DTO deliberately carries no
-     * `registry` (the backend reads it from the project) and treats `digest` as
-     * a claim it re-resolves itself. Sending the claim is what lets the backend
-     * contradict a pipeline that pushed something else.
+     * No new endpoint and no new field. No `digest` is claimed: the backend
+     * resolves it from the registry through its agent and is authoritative. The
+     * DTO has no `registry` field -- the backend reads it from the project --
+     * and `provenanceVerified` is a result, never an input.
      */
-    int registerProvenance(Map target, int buildNumber, String commitSha, String tag, String digest) {
+    int registerProvenance(Map target, int buildNumber, String commitSha, String tag) {
         Map body = [
             projectId  : target.projectId,
             buildNumber: buildNumber,
             commitSha  : commitSha,
             repository : target.repository,
-            tag        : tag,
-            digest     : digest
+            tag        : tag
         ]
         steps.writeFile file: 'acr-provenance-request.json',
             text: groovy.json.JsonOutput.toJson(body)
@@ -236,49 +264,41 @@ class AcrPublisher implements Serializable {
         }
     }
 
+    // -- Stage 1 of 2: discover, verify, push --
     /**
-     * The stage body. Publishing is REQUIRED once a project declares an ACR
-     * repository: a configured project whose push or registration fails must
-     * fail the build, because the platform would otherwise show a build that
-     * looks complete while no deployable artifact exists.
+     * Publishes this run's image. Runs mid-pipeline, right after the Docker
+     * build, because the artifact exists then and pushing needs no platform
+     * state.
      *
-     * A project with no ACR configuration is not an error -- it simply never
-     * asked to publish. It records NOT_CONFIGURED, which is a truthful state
-     * and never a fabricated success. `requirePublish` turns that same case
-     * into a hard failure for a project that explicitly opted in, so nothing
-     * silently degrades.
+     * Provenance is deliberately NOT registered here: the backend re-derives
+     * build identity from the incident WF1 creates out of this build's
+     * end-of-pipeline report, so that incident does not exist yet. Registering
+     * now would be rejected for every project. See recordProvenance().
      */
-    void publish(Map args) {
+    Map publishImage(Map args) {
         String jobName = args.jobName
         String imageName = args.imageName
         String imageTag = args.imageTag
         boolean requirePublish = args.requirePublish == true
         String commitSha = telemetry.checkoutFullSha
 
-        telemetry.docker.provenance_status = 'NOT_ATTEMPTED'
-
         if (!(commitSha ==~ /[a-fA-F0-9]{40}/)) {
             telemetry.docker.push_status = 'FAILED'
             steps.error('ACR_PUBLISH_REVISION_UNAVAILABLE: refusing to publish an artifact whose source commit cannot be proven.')
         }
 
-        Map project = null
-        try {
-            project = fetchProject(jobName)
-        } catch (err) {
-            telemetry.docker.push_status = 'FAILED'
-            steps.error("ACR_PUBLISH_PROJECT_LOOKUP_FAILED: ${err?.message}")
+        // The project-config lookup is the FIRST thing needing the internal
+        // secret, and its answer decides whether anything else runs at all.
+        Map lookup = withInternalSecret { fetchProject(jobName) }
+        if (!lookup.ok) {
+            return skipOrFail(requirePublish, lookup.reason,
+                'the platform internal secret is not available on this controller, so the project configuration cannot be read')
         }
 
-        Map target = resolveTarget(project)
+        Map target = resolveTarget(lookup.value as Map)
         if (!target.ok) {
-            if (requirePublish) {
-                telemetry.docker.push_status = 'FAILED'
-                steps.error("ACR_PUBLISH_TARGET_UNRESOLVED (${target.reason}): this project asked for image publication but no ACR registry/repository is configured for it. Configure azureConfig.registry and azureConfig.imageRepository on the project -- no registry is ever chosen on its behalf.")
-            }
-            telemetry.docker.push_status = 'NOT_CONFIGURED'
-            steps.echo "ACR publication skipped: ${target.reason}. No registry is chosen on the project's behalf."
-            return
+            return skipOrFail(requirePublish, target.reason,
+                'no ACR registry/repository is configured for this project')
         }
 
         String localRef = "${imageName}:${imageTag}"
@@ -294,46 +314,90 @@ class AcrPublisher implements Serializable {
             steps.error("ACR_PUBLISH_TAG_UNDERIVABLE: cannot build a unique tag from build '${imageTag}' and this run's commit.")
         }
 
-        String digest = null
-        try {
-            digest = pushAndResolveDigest(target, localRef, tag)
-        } catch (err) {
-            telemetry.docker.push_status = 'FAILED'
-            steps.error("ACR_PUBLISH_FAILED: ${err?.message}")
+        // ACR credentials are requested ONLY here -- a registry is known to
+        // exist and an identity-verified artifact is ready to go.
+        Map pushed = withAcrCredentials { pushImage(target, localRef, tag) }
+        if (!pushed.ok) {
+            return skipOrFail(requirePublish, pushed.reason,
+                'the ACR credential is not available on this controller')
         }
-        if (!digest) {
+        if (pushed.value != 0) {
             telemetry.docker.push_status = 'FAILED'
-            steps.error('ACR_DIGEST_UNRESOLVED: the registry did not return a sha256 digest for the pushed tag; refusing to record provenance for an artifact we cannot address immutably.')
+            steps.error("ACR_PUSH_FAILED: docker push to ${target.registry}.azurecr.io/${target.repository}:${tag} exited ${pushed.value}.")
         }
 
-        // The push really happened; record it before provenance is attempted so
-        // a registration failure never erases a true publication.
+        // The push really happened. Recorded before provenance is attempted so
+        // a later registration failure can never rewrite this fact.
         telemetry.docker.push_status = 'SUCCESS'
         telemetry.docker.registry = target.registry
         telemetry.docker.repository = target.repository
         telemetry.docker.published_tag = tag
-        telemetry.docker.digest = digest
-        // Published is NOT deployed. This pipeline observes no deployment and
-        // therefore never writes one.
         telemetry.docker.published_reference = "${target.registry}.azurecr.io/${target.repository}:${tag}"
+        // Registration is deferred by design, so say so instead of leaving a
+        // stale NOT_ATTEMPTED in the report this build is about to send.
+        telemetry.docker.provenance_status = 'PENDING'
+        // digest stays null here: the backend resolves it authoritatively.
+        steps.echo "Image published: ${telemetry.docker.published_reference} (provenance registration deferred until the platform has ingested this build)"
+        return [published: true, target: target, tag: tag, commitSha: commitSha, buildNumber: imageTag]
+    }
+
+    /** One place for "not configured" vs "you asked for this, so it must work". */
+    private Map skipOrFail(boolean requirePublish, String reason, String explanation) {
+        if (requirePublish) {
+            telemetry.docker.push_status = 'FAILED'
+            steps.error("ACR_PUBLISH_REQUIRED_BUT_UNAVAILABLE (${reason}): this project asked for image publication but ${explanation}. Configure it -- nothing is ever chosen on the project's behalf.")
+        }
+        telemetry.docker.push_status = 'NOT_CONFIGURED'
+        steps.echo "ACR publication skipped (${reason}): ${explanation}. No registry or credential is assumed on the project's behalf."
+        return [published: false, reason: reason]
+    }
+
+    // -- Stage 2 of 2: record provenance, after the platform has the build --
+    /**
+     * Registers the published artifact's provenance, AFTER this build's report
+     * has been sent, because the backend re-derives build identity from the
+     * incident WF1 creates from that report. Ingestion is asynchronous, so this
+     * retries within a bounded window rather than assuming instant arrival.
+     *
+     * Fails the build when a published artifact cannot be recorded: under
+     * governance an unrecorded artifact is not deployable, so a green build
+     * implying otherwise would be a lie. The push itself stays SUCCESS.
+     */
+    void recordProvenance(Map publication, int attempts, int waitSeconds) {
+        if (!publication || publication.published != true) { return }
 
         int buildNumber = 0
-        try {
-            buildNumber = Integer.parseInt((imageTag ?: '').trim())
-        } catch (ignored) {
-            buildNumber = 0
-        }
+        try { buildNumber = Integer.parseInt(String.valueOf(publication.buildNumber).trim()) }
+        catch (ignored) { buildNumber = 0 }
         if (buildNumber < 1) {
             telemetry.docker.provenance_status = 'FAILED'
-            steps.error("ACR_PROVENANCE_BUILD_NUMBER_INVALID: '${imageTag}' is not a usable build number for the provenance contract.")
+            steps.error("ACR_PROVENANCE_BUILD_NUMBER_INVALID: '${publication.buildNumber}' is not a usable build number for the provenance contract.")
         }
 
-        int code = registerProvenance(target, buildNumber, commitSha, tag, digest)
-        if (code != 0) {
+        int total = Math.max(1, attempts)
+        Map attempt = withInternalSecret {
+            int last = 1
+            for (int i = 1; i <= total; i++) {
+                last = registerProvenance(publication.target as Map, buildNumber,
+                    publication.commitSha as String, publication.tag as String)
+                if (last == 0) { return 0 }
+                if (i < total) {
+                    steps.echo "Provenance not recorded yet (attempt ${i}/${total}); the platform may not have ingested this build. Retrying."
+                    steps.sleep(time: waitSeconds, unit: 'SECONDS')
+                }
+            }
+            return last
+        }
+
+        if (!attempt.ok) {
+            telemetry.docker.provenance_status = 'FAILED'
+            steps.error("ACR_PROVENANCE_SECRET_UNAVAILABLE (${attempt.reason}): the image was published but provenance cannot be recorded without the platform internal secret.")
+        }
+        if (attempt.value != 0) {
             telemetry.docker.provenance_status = 'FAILED'
             steps.error('ACR_PROVENANCE_REGISTRATION_FAILED: the image was published but the platform refused or could not record its provenance. Failing the build: an unrecorded artifact is not deployable under governance.')
         }
         telemetry.docker.provenance_status = 'SUCCESS'
-        steps.echo "Image published and provenance recorded: ${telemetry.docker.published_reference} (${digest})"
+        steps.echo "Provenance recorded for ${telemetry.docker.published_reference}. Published is not deployed: no deployment state is implied."
     }
 }
