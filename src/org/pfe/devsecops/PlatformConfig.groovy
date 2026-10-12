@@ -36,7 +36,18 @@ class PlatformConfig implements Serializable {
     static final String SONAR_ANALYSIS_MODE = 'COMMUNITY_EXACT_SHA' // or 'DEVELOPER_NATIVE_PR'
 
     // ---- Platform / n8n / backend ----
-    static final String BACKEND_URL     = 'http://pfe-backend:3001'
+    // Alias de SERVICE, jamais un nom de conteneur. `pfe-backend` etait le nom
+    // du conteneur de la release r98 : il a ete remplace par `pfe-backend-r99`
+    // le 2026-10-10, et le nom est mort avec lui. Resultat constate sur
+    // app-test-pfe-vermeg #11 et #12 : « curl: (6) Could not resolve host:
+    // pfe-backend », l'etape Publish Image (ACR) echoue, `set -e` arrete le
+    // pipeline -- et les cinq etapes suivantes, dont Trivy, OWASP et ZAP, ne
+    // tournent plus du tout. Deux jours sans aucune analyse de securite sur ce
+    // projet, pour un nom d'hote.
+    // `backend` est l'alias reseau que CHAQUE release du backend publie, sans
+    // suffixe de version : il survit au prochain remplacement, la ou
+    // `backend-r99` casserait de nouveau.
+    static final String BACKEND_URL     = 'http://backend:3001'
     static final String N8N_WEBHOOK_URL = 'http://n8n:5678/webhook/jenkins-event'
 
     // ---- Kubernetes / ZAP ----
