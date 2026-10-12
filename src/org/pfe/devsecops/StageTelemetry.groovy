@@ -62,7 +62,12 @@ class StageTelemetry implements Serializable {
         technicalCode    : null,
         launchErrorType  : null,
         launchExitCode   : null,
-        diagnosticMessage: null
+        diagnosticMessage: null,
+        // Z2 -- couverture : nombre d'URL que ZAP connaissait de la cible a la
+        // fin du scan. Fait observe, jamais une conclusion : c'est lui qui
+        // empeche de lire « 0 alerte » comme « application saine ». null quand
+        // la mesure n'a pas pu etre relevee.
+        urlsKnown        : null
     ]
 
     /**

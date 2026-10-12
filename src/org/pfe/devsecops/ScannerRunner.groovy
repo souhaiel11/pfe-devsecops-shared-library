@@ -352,13 +352,16 @@ ODC_SETTINGS
      * so the post-stage callback can emit truthful, content-aware status --
      * never "COMPLETED" from bare file existence.
      */
-    void runZap(String k8sNamespace, String kubeconfigPath, String zapTargetUrl, String buildNumber, String reportBase) {
+    void runZap(String k8sNamespace, String kubeconfigPath, String zapTargetUrl, String buildNumber, String reportBase, List seedPaths = []) {
         steps.catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
             String zapPod = "zap-scan-${buildNumber}"
             steps.withEnv([
                 "KUBECONFIG=${kubeconfigPath}", "K8S_NAMESPACE=${k8sNamespace}",
                 "REPORT_BASE=${reportBase}", "ZAP_POD=${zapPod}",
-                "ZAP_IMAGE=${PlatformConfig.ZAP_IMAGE}", "ZAP_TARGET_URL=${zapTargetUrl}"
+                "ZAP_IMAGE=${PlatformConfig.ZAP_IMAGE}", "ZAP_TARGET_URL=${zapTargetUrl}",
+                // Chemins d'amorcage du spider, separes par des espaces. Vide =
+                // comportement d'origine, strictement inchange.
+                "ZAP_SEED_PATHS=${(seedPaths ?: []).findAll { it }.collect { it.toString().trim() }.join(' ')}"
             ]) {
                 steps.sh 'mkdir -p "$REPORT_BASE"'
 
@@ -404,6 +407,16 @@ ODC_SETTINGS
                     script: 'test -s "$REPORT_BASE/zap-report.json" && ! grep -q "zap_report_missing\\|zap_k8s_unreachable\\|zap_pod_launch_failed" "$REPORT_BASE/zap-report.json"'
                 ) == 0
                 telemetry.zap.resultAvailable = reportUsable
+                // Z2 -- couverture relevee dans le pod. Absente ou illisible =>
+                // reste null : on ne devine pas une couverture.
+                String urlCountRaw = steps.sh(
+                    returnStdout: true,
+                    script: 'cat "$REPORT_BASE/zap.urlcount" 2>/dev/null || true'
+                ).trim()
+                if (urlCountRaw ==~ /\d{1,9}/) {
+                    telemetry.zap.urlsKnown = urlCountRaw.toInteger()
+                    steps.echo "ZAP a explore ${telemetry.zap.urlsKnown} URL de la cible."
+                }
                 if (!reportUsable) {
                     // technicalCode stays ZAP_SCAN_POD_DISAPPEARED -- it is derived by
                     // WF1 from the zap_report_missing stub status and maps to
@@ -471,6 +484,8 @@ spec:
       env:
         - name: ZAP_TARGET_URL
           value: "$ZAP_TARGET_URL"
+        - name: ZAP_SEED_PATHS
+          value: "$ZAP_SEED_PATHS"
       resources:
         requests:
           memory: "768Mi"
@@ -544,6 +559,21 @@ spec:
           except Exception as e:
               print("TARGET_ACCESS_ERROR", e)
 
+          # Z2 -- AMORCAGE. Le spider part de la racine et suit des liens ; une
+          # API REST n'en publie aucun. Constate sur pfe-app-test : 3 URL
+          # explorees, alors que /api/auth/health, /api/auth/login et
+          # /api/auth/register sont ouverts et constituent toute la surface
+          # anonyme reellement exposee. Les chemins d'amorcage sont fournis par
+          # le projet (config.zapSeedPaths) ; sans eux, comportement inchange.
+          seeds = [sp for sp in os.environ.get("ZAP_SEED_PATHS", "").split() if sp]
+          for seed in seeds:
+              seed_url = target.rstrip("/") + seed
+              try:
+                  call("/JSON/core/action/accessUrl/", {"url": seed_url, "followRedirects": "true"})
+                  print("SEED_ACCESSED %s" % seed_url)
+              except Exception as e:
+                  print("SEED_ACCESS_ERROR %s %s" % (seed_url, e))
+
           try:
               sid = json.loads(call("/JSON/spider/action/scan/", {"url": target, "recurse": "true"}))["scan"]
               while True:
@@ -563,6 +593,17 @@ spec:
               print("ACTIVE_SCAN_DONE")
           except Exception as e:
               print("ACTIVE_SCAN_ERROR", e)
+
+          # Z2 -- COUVERTURE MESUREE. Le nombre d'URL que ZAP connait du site
+          # cible, ecrit a cote du rapport. C'est ce chiffre qui empeche de lire
+          # « 0 alerte » comme « application saine » : un scan qui n'a vu que la
+          # racine ne prouve rien.
+          try:
+              known = json.loads(call("/JSON/core/view/urls/", {"baseurl": target}))["urls"]
+              open("/zap/wrk/zap.urlcount", "w").write(str(len(known)))
+              print("ZAP_URLS_KNOWN=%d" % len(known))
+          except Exception as e:
+              print("URL_COUNT_ERROR", e)
 
           try:
               open("/zap/wrk/zap-report.json","w").write(call("/OTHER/core/other/jsonreport/", timeout=60))
@@ -623,13 +664,27 @@ PODSPEC_EOF
         kubectl logs "$ZAP_POD" -n "$K8S_NAMESPACE" || true
 
         echo "=== In-pod failure marker (if any) ==="
-        kubectl exec "$ZAP_POD" -n "$K8S_NAMESPACE" -- sh -c 'cat /zap/wrk/zap.failed 2>/dev/null' > "$REPORT_BASE/zap-inpod-failure.txt" 2>/dev/null || true
-        cat "$REPORT_BASE/zap-inpod-failure.txt" 2>/dev/null || true
+        # Z3 -- la redirection creait le fichier MEME quand il n'y avait aucun
+        # echec : le dossier d'un build reussi contenait un "zap-inpod-failure"
+        # vide, au nom alarmant pour qui audite les artefacts. On ne l'ecrit
+        # plus que s'il porte quelque chose.
+        ZAP_INPOD_MARKER=$(kubectl exec "$ZAP_POD" -n "$K8S_NAMESPACE" -- sh -c 'cat /zap/wrk/zap.failed 2>/dev/null' 2>/dev/null || true)
+        if [ -n "$ZAP_INPOD_MARKER" ]; then
+          printf '%s' "$ZAP_INPOD_MARKER" > "$REPORT_BASE/zap-inpod-failure.txt"
+          cat "$REPORT_BASE/zap-inpod-failure.txt"
+        else
+          rm -f "$REPORT_BASE/zap-inpod-failure.txt"
+          echo "(aucun marqueur d'echec in-pod)"
+        fi
 
         echo "=== Retrieving reports ==="
         kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.json" "$REPORT_BASE/zap-report.json" || true
         kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap-report.html" "$REPORT_BASE/zap-report.html" || true
         kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap.log"        "$REPORT_BASE/zap.log"        || true
+        # Z2 -- COUVERTURE. Sans ce chiffre, « 0 alerte » est indistinguable de
+        # « application saine » alors qu'il signifie souvent « le spider n'a
+        # rien pu explorer » (cas constate : 3 URL, toutes en 403).
+        kubectl cp "$K8S_NAMESPACE/$ZAP_POD:/zap/wrk/zap.urlcount"    "$REPORT_BASE/zap.urlcount"   2>/dev/null || true
 
         if [ ! -s "$REPORT_BASE/zap-report.json" ]; then
           echo '{"site":[],"status":"zap_report_missing"}' > "$REPORT_BASE/zap-report.json"

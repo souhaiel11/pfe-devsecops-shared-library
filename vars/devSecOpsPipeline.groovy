@@ -31,6 +31,11 @@ import groovy.json.JsonSlurperClassic
  *                        genuinely does not run tests in CI yet -- this is a
  *                        truthful declaration, not a convenience default.
  *   zapTargetUrl      - String override if the deployed Service name/port differs
+ *   zapSeedPaths      - List de chemins a faire visiter a ZAP avant le spider
+ *                       (ex: ['/api/auth/health', '/api/auth/register']). Une API
+ *                       REST ne publie aucun lien : sans amorcage le spider ne
+ *                       voit que la racine. Facultatif ; absent = comportement
+ *                       d'origine.
  *                        from the http://<applicationName>:8080 convention.
  */
 def call(Closure body = null) {
@@ -82,6 +87,11 @@ def call(Closure body = null) {
             String workingDirectory = config.workingDirectory ?: null
             boolean configuredSkipTests = config.containsKey('skipTests') ? config.skipTests : false
             String zapTargetUrl = config.zapTargetUrl ?: "http://${applicationName}:8080"
+            // Z2 -- chemins d'amorcage du spider ZAP. Une API REST ne publie
+            // aucun lien : sans amorcage, le spider ne voit que la racine et le
+            // scan actif ne porte sur presque rien. Facultatif : absent =>
+            // comportement d'origine, strictement inchange.
+            List zapSeedPaths = (config.zapSeedPaths ?: []) as List
 
             boolean isPR = env.CHANGE_ID != null
             Map prValidation = isPR ? prValidationContext(params.PFE_VALIDATION_CONTEXT) : [:]
@@ -91,8 +101,18 @@ def call(Closure body = null) {
             boolean skipTests = isPR ? false : configuredSkipTests
             telemetry.prValidation = prValidation
             String imageTag = env.BUILD_NUMBER
-            String reportBase = "${PlatformConfig.JENKINS_REPORT_ROOT}/${applicationName}/${env.BUILD_NUMBER}"
-            String n8nReportBase = "${PlatformConfig.N8N_REPORT_ROOT}/${applicationName}/${env.BUILD_NUMBER}"
+            // E1 -- le job principal et le job multibranche de validation de PR
+            // ont chacun leur PROPRE numerotation et partageaient le meme dossier
+            // <projet>/<numero>. Constate : les rapports de la validation PR-46
+            // (build 1) occupaient le dossier du build principal 1, et la preuve
+            // affichee pour le build principal 156 pointait dessus. Deux
+            // executions numerotees pareil s'ecrasaient purement et simplement.
+            // Le perimetre d'execution entre donc dans le chemin. Les dossiers
+            // deja ecrits restent lisibles : ils sont references par chemin
+            // complet dans les incidents, jamais recalcules.
+            String runScope = isPR ? "pr-${env.CHANGE_ID}" : 'main'
+            String reportBase = "${PlatformConfig.JENKINS_REPORT_ROOT}/${applicationName}/${runScope}/${env.BUILD_NUMBER}"
+            String n8nReportBase = "${PlatformConfig.N8N_REPORT_ROOT}/${applicationName}/${runScope}/${env.BUILD_NUMBER}"
 
             boolean checkoutFailed = false
             boolean zapStageEntered = false
@@ -216,7 +236,7 @@ def call(Closure body = null) {
                             }
                             stage('ZAP DAST Scan') {
                                 timeout(time: PlatformConfig.TIMEOUT_ZAP_MINUTES, unit: 'MINUTES') {
-                                    scanners.runZap(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, zapTargetUrl, env.BUILD_NUMBER, reportBase)
+                                    scanners.runZap(PlatformConfig.K8S_NAMESPACE, PlatformConfig.KUBECONFIG_PATH, zapTargetUrl, env.BUILD_NUMBER, reportBase, zapSeedPaths)
                                 }
                             }
                         } else if (!isPR) {
