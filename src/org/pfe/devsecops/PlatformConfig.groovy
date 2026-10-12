@@ -32,7 +32,14 @@ class PlatformConfig implements Serializable {
     static final String SONAR_ANALYSIS_MODE = 'COMMUNITY_EXACT_SHA' // or 'DEVELOPER_NATIVE_PR'
 
     // ---- Platform / n8n / backend ----
-    static final String BACKEND_URL     = 'http://pfe-backend:3001'
+    // Alias de SERVICE, jamais un nom de conteneur : `pfe-backend` etait le nom
+    // du conteneur de la release r98, remplace par `pfe-backend-r99` le
+    // 2026-10-10, et le nom est mort avec lui. Inutilise sur cette branche
+    // aujourd'hui, mais faux -- et c'est exactement ce qui a casse la branche
+    // feat/acr-publish-provenance (app-test-pfe-vermeg #11 et #12 arretes a la
+    // 6e etape sur 11, plus aucune analyse de securite pendant deux jours).
+    // `backend` est publie par chaque release du backend, sans suffixe.
+    static final String BACKEND_URL     = 'http://backend:3001'
     static final String N8N_WEBHOOK_URL = 'http://n8n:5678/webhook/jenkins-event'
 
     // ---- Kubernetes / ZAP ----
