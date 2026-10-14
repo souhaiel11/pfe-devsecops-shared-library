@@ -91,6 +91,29 @@ grep -q "VALEUR-DE-TEST-NON-SECRETE" "$WORK/settings-test.xml" \
     || ok "le fichier de settings ne porte qu une reference, jamais la valeur"
 
 echo
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R59 — la section R58 a ete SUPPRIMEE avec le code qu'elle testait.
+#
+# Elle verifiait, dans un vrai shell, que le script de provenance genere par
+# AcrPublisher lisait son verdict dans le CORPS de la reponse et non dans le
+# code HTTP (le bug du build #10). Ce script n'existe plus : Jenkins n'enregistre
+# plus aucune provenance.
+#
+# La semantique elle-meme n'est pas perdue -- elle a suivi l'ecrivain unique et
+# est testee la ou elle vit desormais, cote plateforme :
+#   backend/src/azure-deploy/provenance-reconciliation.spec.ts
+#     - seul PROVENANCE_VERIFIED vaut enregistrement
+#     - UNVERIFIED_MANUAL_ARTIFACT jamais accepte automatiquement
+#     - statut absent/illisible jamais un succes
+#     - DEPLOY_COMMIT_MISSING seul cas rattrapable
+#     - 9 refus definitifs restent terminaux
+#
+# Garder ici des assertions sur un script absent les ferait passer pour la
+# mauvaise raison.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
 echo "shell: $PASS reussis, $FAIL echoues"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "ALL SHELL STATUS TESTS PASSED"

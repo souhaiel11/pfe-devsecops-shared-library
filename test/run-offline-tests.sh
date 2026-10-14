@@ -25,12 +25,17 @@ echo "== Compiling vars/devSecOpsPipeline.groovy (syntax check; Jenkins DSL step
 java -cp "$GROOVY_JAR:$OUT" org.codehaus.groovy.tools.FileSystemCompiler -d "$OUT" \
     "$LIB_ROOT"/vars/devSecOpsPipeline.groovy
 
-echo "== Compiling test harness (FakeSteps + offline_tests) =="
+echo "== Compiling test harness (FakeSteps + offline_tests + acr_publisher_tests) =="
 java -cp "$GROOVY_JAR:$OUT" org.codehaus.groovy.tools.FileSystemCompiler -d "$OUT" \
-    "$HERE"/FakeSteps.groovy "$HERE"/offline_tests.groovy
+    "$HERE"/FakeSteps.groovy "$HERE"/offline_tests.groovy "$HERE"/acr_publisher_tests.groovy
 
 echo "== Running executable offline tests =="
 LIB_ROOT="$LIB_ROOT" java -cp "$GROOVY_JAR:$OUT" offline_tests
+
+# R50 -- publication ACR + provenance. Entierement simule : aucun identifiant,
+# aucun push, aucun appel Azure.
+echo "== Running ACR publication tests (fully mocked) =="
+LIB_ROOT="$LIB_ROOT" java -cp "$GROOVY_JAR:$OUT" acr_publisher_tests
 
 # Le harnais Groovy verifie le CONTRAT des scripts generes. Celui-ci verifie
 # leur COMPORTEMENT dans le meme shell que Jenkins -- propagation du statut et

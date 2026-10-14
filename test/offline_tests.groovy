@@ -448,6 +448,8 @@ Map captured = null
 def reporterStub = new Expando(buildPayload: { Map args -> shaReporter.buildPayload(args) },
     send: { Map result, Object base, Object build -> captured = result })
 def pipelineScript = this.class.classLoader.loadClass('devSecOpsPipeline').newInstance()
+// R59 -- reportToPlatform ne prend plus acrPublisher : Jenkins n'enregistre
+// plus aucune provenance (ecrivain unique = la plateforme).
 pipelineScript.reportToPlatform(reportingScript, appTelemetry, cleanupStub, reporterStub,
     [isPR: false, checkoutFailed: false, zapStageEntered: false, applicationName: 'pfe-app-test'])
 check(captured?.commitSha == applicationSha && captured?.commit == applicationSha.take(8),
@@ -458,6 +460,71 @@ check(producerSource.contains('def scmVars = checkout(scm)')
     && producerSource.contains('telemetry.checkoutFullSha = capturedSha ?: (scmVars?.GIT_COMMIT ?: null)')
     && producerSource.contains('checkoutSha     : telemetry.checkoutFullSha'),
     'SHA - capture and forwarding remain tied to application checkout')
+
+// ---- R59: Jenkins n'est PLUS un ecrivain de provenance ---------------------
+//
+// Build #10 a montre que faire attendre Jenkins la persistance de l'identite de
+// build par WF1 (104 s mesures) rend la correction dependante d'une course.
+// Elargir la fenetre ne corrige rien : on a donc retire l'ecrivain. La
+// plateforme enregistre la provenance, declenchee par cette persistance.
+//
+// Ce que Jenkins doit encore faire -- et uniquement cela : pousser l'image,
+// puis rapporter honnetement ses coordonnees avec provenance_status = PENDING.
+String r59Source = new File(System.getenv('LIB_ROOT'), 'vars/devSecOpsPipeline.groovy').text
+String r59Publisher = new File(System.getenv('LIB_ROOT'), 'src/org/pfe/devsecops/AcrPublisher.groovy').text
+
+// ECRIVAIN UNIQUE : aucun appel de provenance ne subsiste cote pipeline.
+check(!r59Source.contains('recordProvenance'),
+    'R59 - le pipeline n\'appelle plus recordProvenance')
+check(!r59Source.contains("stage('Record Image Provenance')"),
+    'R59 - l\'etape Record Image Provenance a disparu du pipeline')
+check(!r59Publisher.contains('int registerProvenance('),
+    'R59 - registerProvenance a ete supprime (pas d\'ecrivain latent rebranchable)')
+check(!r59Publisher.contains('void recordProvenance('),
+    'R59 - recordProvenance a ete supprime')
+// On assertionne sur du CODE, pas sur la presence du mot : les deux fichiers
+// mentionnent encore l'endpoint dans des commentaires qui expliquent
+// precisement qui en est desormais proprietaire -- ce qui est voulu.
+def strippedCode = { String src ->
+    src.split('\n').findAll { String line ->
+        String s = line.trim()
+        !(s.startsWith('//') || s.startsWith('*') || s.startsWith('/*') || s.startsWith('#'))
+    }.join('\n')
+}
+check(!strippedCode(r59Publisher).contains('artifacts/provenance'),
+    'R59 - plus aucun appel a l\'endpoint de provenance depuis la bibliotheque')
+check(!strippedCode(r59Source).contains('artifacts/provenance'),
+    'R59 - ni depuis le pipeline : PROVENANCE_AUTOMATIC_WRITERS cote Jenkins = 0')
+// Garde-fou du garde-fou : la version non filtree DOIT encore contenir le mot,
+// sinon ces deux assertions passeraient pour la mauvaise raison.
+check(r59Publisher.contains('artifacts/provenance') || r59Source.contains('artifacts/provenance'),
+    'R59 - controle : le filtrage des commentaires est bien ce qui fait passer les deux assertions ci-dessus')
+
+// Aucune fenetre d'attente de provenance ne subsiste : plus rien a deviner.
+check(!r59Source.contains('TIMEOUT_PROVENANCE_MINUTES'),
+    'R59 - plus aucune fenetre d\'attente de provenance dans le pipeline')
+
+// Ce que Jenkins CONSERVE : la publication, et un PENDING honnete.
+check(r59Publisher.contains("telemetry.docker.provenance_status = 'PENDING'"),
+    'R59 - une publication reussie laisse provenance_status = PENDING (publie, pas encore enregistre)')
+check(r59Publisher.contains('int pushImage(') && r59Source.contains('publishImage('),
+    'R59 - la publication de l\'image reste bien le travail de Jenkins')
+
+// PENDING n'est pas un echec : il ne doit jamais degrader le resultat du build
+// ni le fait historique du push.
+def r59Steps = new FakeSteps()
+def r59Tel = new StageTelemetry()
+r59Tel.docker.push_status = 'SUCCESS'
+r59Tel.docker.provenance_status = 'PENDING'
+check(r59Tel.docker.push_status == 'SUCCESS',
+    'R59 - push_status = SUCCESS coexiste avec provenance PENDING (deux faits distincts)')
+check(!(r59Source =~ /provenance[^\n]*currentBuild\.result/),
+    'R59 - un PENDING de provenance ne touche jamais le resultat du build')
+
+// Le catch de reporting reste, lui, deliberement non bloquant.
+check(r59Source.contains('Reporting failed (non-fatal, original build result preserved)'),
+    'R59 - la semantique non bloquante du reporting est inchangee')
+
 
 // ---- R80: publishSemanticTestEvidence() -- structured JUnit publication + raw testcase extraction ----
 def r80Steps = new FakeSteps()

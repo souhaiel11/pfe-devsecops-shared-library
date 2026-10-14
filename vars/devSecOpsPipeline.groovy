@@ -3,6 +3,7 @@ import org.pfe.devsecops.ProjectDetector
 import org.pfe.devsecops.StageTelemetry
 import org.pfe.devsecops.BuildRunner
 import org.pfe.devsecops.DockerRunner
+import org.pfe.devsecops.AcrPublisher
 import org.pfe.devsecops.ScannerRunner
 import org.pfe.devsecops.PlatformReporter
 import org.pfe.devsecops.SafeCleanup
@@ -75,6 +76,7 @@ def call(Closure body = null) {
             def detector = new ProjectDetector(this)
             def buildRunner = new BuildRunner(this, telemetry)
             def dockerRunner = new DockerRunner(this, telemetry)
+            def acrPublisher = new AcrPublisher(this, telemetry)
             def scanners = new ScannerRunner(this, telemetry)
             def reporter = new PlatformReporter(this)
             def cleanup = new SafeCleanup(this)
@@ -117,11 +119,21 @@ def call(Closure body = null) {
             boolean checkoutFailed = false
             boolean zapStageEntered = false
             boolean dockerfilePresent = false
+            // R56 — le resultat de publication voyage par telemetry.imagePublication,
+            // jamais par une locale : une locale affectee dans la closure
+            // withCredentials n'est pas visible depuis le bloc de rapport (build #9).
 
             withCredentials([
                 string(credentialsId: PlatformConfig.CRED_SONAR_TOKEN, variable: 'SONAR_TOKEN'),
                 string(credentialsId: PlatformConfig.CRED_N8N_API_KEY, variable: 'N8N_API_KEY'),
                 string(credentialsId: PlatformConfig.CRED_NVD_API_KEY, variable: 'NVD_API_KEY')
+                // R51 — les identifiants de PUBLICATION ne sont deliberement PAS
+                // lies ici. Les lier globalement faisait echouer TOUT projet des
+                // qu'ils manquaient, y compris ceux qui n'ont aucun ACR configure
+                // et n'ont jamais demande a publier. AcrPublisher les acquiert
+                // lui-meme, dans le chemin exact qui les utilise :
+                //   N8N_INTERNAL_SECRET  lecture de la config projet, puis POST provenance
+                //   ACR_CREDENTIALS      le push, et seulement une fois un registre connu
             ]) {
                 stage('Init') {
                     env.PATH = "${tool 'M3'}/bin:${env.PATH}"
@@ -204,6 +216,30 @@ def call(Closure body = null) {
                         if (dockerfilePresent) {
                             stage('Docker Build') {
                                 dockerRunner.build(imageName, imageTag, config.dockerfile, workingDirectory)
+                            }
+                        }
+
+                        // R50 — publication de l'image de CETTE execution dans l'ACR du
+                        // projet, puis enregistrement de sa provenance.
+                        //
+                        // Jamais sur un build de PR : une PR n'est pas un artefact
+                        // deployable, et la publier polluerait le depot d'images avec des
+                        // propositions. Jamais non plus si l'etape Docker n'a pas reussi :
+                        // il n'y aurait rien a publier.
+                        //
+                        // Cette etape FAIT ECHOUER le build si la publication ou
+                        // l'enregistrement echoue pour un projet qui a un ACR configure.
+                        // Elle ne declare jamais l'image deployee.
+                        if (PlatformConfig.ACR_PUBLISH_ENABLED && dockerfilePresent && !isPR
+                                && telemetry.docker.build_status == 'SUCCESS') {
+                            stage('Publish Image (ACR)') {
+                                acrPublisher.publishImage(
+                                    jobName       : env.JOB_NAME,
+                                    imageName     : imageName,
+                                    imageTag      : imageTag,
+                                    requirePublish: config.containsKey('requireImagePublication')
+                                                        ? config.requireImagePublication : false
+                                )
                             }
                         }
 
@@ -304,7 +340,13 @@ def applicationServiceName(String zapTargetUrl) {
  * around (Section 13). Any failure here is swallowed and logged: it must
  * never mask the pipeline's real result (Section 14).
  */
+// R59 — acrPublisher n'est plus un parametre : cette methode n'enregistre plus
+// aucune provenance (ecrivain unique = la plateforme). La lecon du build #9
+// reste valable pour tout futur collaborateur ajoute ici : reportToPlatform est
+// une methode DISTINCTE de call() et ne capture aucune de ses locales, donc
+// tout collaborateur doit etre passe explicitement.
 def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
+  try {
     script.timeout(time: PlatformConfig.TIMEOUT_POST_REPORT_MINUTES, unit: 'MINUTES') {
         try {
             def env = script.env
@@ -451,7 +493,18 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
                     image       : "${ctx.imageName}:${ctx.imageTag}",
                     build_status: telemetry.docker.build_status,
                     image_tag   : telemetry.docker.image_tag,
-                    push_status : telemetry.docker.push_status
+                    push_status : telemetry.docker.push_status,
+                    // R50 — faits de PUBLICATION, additifs a cote du statut de
+                    // construction. Nuls tant que le registre n'a rien confirme :
+                    // ils ne sont jamais deduits de la configuration du projet.
+                    // Aucun champ « deployed » : publier n'est pas deployer, et ce
+                    // pipeline n'observe aucun deploiement.
+                    provenance_status  : telemetry.docker.provenance_status,
+                    registry           : telemetry.docker.registry,
+                    repository         : telemetry.docker.repository,
+                    published_tag      : telemetry.docker.published_tag,
+                    published_reference: telemetry.docker.published_reference,
+                    digest             : telemetry.docker.digest
                 ],
                 // R46 -- diagnostics factuels d'OWASP, additifs a cote du drapeau
                 // reports.available.owasp que WF1 consomme deja. Jenkins enonce des
@@ -490,13 +543,37 @@ def reportToPlatform(script, telemetry, cleanup, reporter, Map ctx) {
             }
 
             reporter.send(payloadObject, ctx.reportBase, currentBuild)
+
         } catch (ex) {
             // Reporting/cleanup must never mask the pipeline's real result
             // (Section 14) -- log and move on, never rethrow, never touch
             // currentBuild.result here.
             script.echo "Reporting failed (non-fatal, original build result preserved): ${ex.message}"
-        } finally {
-            cleanup.safeDeleteDir()
         }
     }
+
+    // R59 — Jenkins n'enregistre PLUS la provenance. UN SEUL ecrivain
+    // automatique, et c'est la plateforme.
+    //
+    // Pourquoi : le backend re-derive l'identite de build depuis l'incident que
+    // WF1 cree a partir de CE rapport. Jenkins devait donc DEVINER quand cette
+    // ecriture aurait lieu et attendre derriere une fenetre (104 s mesures au
+    // build #10 pour un budget de 90 s). Elargir la fenetre ne rend pas cela
+    // correct, seulement « souvent vrai » : la correction dependait d'une
+    // course.
+    //
+    // Desormais le declencheur est CAUSAL : la persistance de
+    // sourceCommitSha + enrichedData.docker (un seul PUT atomique) declenche
+    // elle-meme l'enregistrement cote backend
+    // (ProvenanceReconciliationService). Une ingestion lente reste correcte, et
+    // une panne transitoire est re-tentable via
+    // POST /api/azure-deploy/artifacts/provenance/reconcile/:incidentId -- sans
+    // reconstruire ni repousser une image identique.
+    //
+    // Ce que Jenkins fait encore, et c'est tout : pousser l'image, puis
+    // rapporter honnetement ses coordonnees avec provenance_status = PENDING.
+    // PENDING n'est pas un echec : c'est « publie, pas encore enregistre ».
+  } finally {
+    cleanup.safeDeleteDir()
+  }
 }

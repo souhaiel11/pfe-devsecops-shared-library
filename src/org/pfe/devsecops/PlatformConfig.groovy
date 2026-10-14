@@ -17,6 +17,10 @@ class PlatformConfig implements Serializable {
     static final String CRED_SONAR_TOKEN = 'SONAR_TOKEN'
     static final String CRED_N8N_API_KEY = 'N8N_API_KEY'
     static final String CRED_NVD_API_KEY = 'NVD_API_KEY'
+    // Publication ACR (R50). Identifiants de la PLATEFORME, jamais par projet :
+    // tous les projets poussent vers le meme registre, chacun dans SON depot.
+    static final String CRED_ACR = 'ACR_CREDENTIALS'                 // usernamePassword
+    static final String CRED_INTERNAL_SECRET = 'N8N_INTERNAL_SECRET' // string
 
     // ---- SonarQube ----
     static final String SONAR_ENV_NAME = 'sq1'          // withSonarQubeEnv() name configured in Jenkins
@@ -32,13 +36,17 @@ class PlatformConfig implements Serializable {
     static final String SONAR_ANALYSIS_MODE = 'COMMUNITY_EXACT_SHA' // or 'DEVELOPER_NATIVE_PR'
 
     // ---- Platform / n8n / backend ----
-    // Alias de SERVICE, jamais un nom de conteneur : `pfe-backend` etait le nom
-    // du conteneur de la release r98, remplace par `pfe-backend-r99` le
-    // 2026-10-10, et le nom est mort avec lui. Inutilise sur cette branche
-    // aujourd'hui, mais faux -- et c'est exactement ce qui a casse la branche
-    // feat/acr-publish-provenance (app-test-pfe-vermeg #11 et #12 arretes a la
-    // 6e etape sur 11, plus aucune analyse de securite pendant deux jours).
-    // `backend` est publie par chaque release du backend, sans suffixe.
+    // Alias de SERVICE, jamais un nom de conteneur. `pfe-backend` etait le nom
+    // du conteneur de la release r98 : il a ete remplace par `pfe-backend-r99`
+    // le 2026-10-10, et le nom est mort avec lui. Resultat constate sur
+    // app-test-pfe-vermeg #11 et #12 : « curl: (6) Could not resolve host:
+    // pfe-backend », l'etape Publish Image (ACR) echoue, `set -e` arrete le
+    // pipeline -- et les cinq etapes suivantes, dont Trivy, OWASP et ZAP, ne
+    // tournent plus du tout. Deux jours sans aucune analyse de securite sur ce
+    // projet, pour un nom d'hote.
+    // `backend` est l'alias reseau que CHAQUE release du backend publie, sans
+    // suffixe de version : il survit au prochain remplacement, la ou
+    // `backend-r99` casserait de nouveau.
     static final String BACKEND_URL     = 'http://backend:3001'
     static final String N8N_WEBHOOK_URL = 'http://n8n:5678/webhook/jenkins-event'
 
@@ -56,6 +64,9 @@ class PlatformConfig implements Serializable {
     static final boolean TRIVY_ENABLED = true
     static final boolean OWASP_ENABLED = true
     static final boolean ZAP_ENABLED_ON_BRANCH_BUILDS = true // never on PR builds
+    // Publier l'image dans l'ACR du projet. Un projet sans azureConfig reste
+    // NOT_CONFIGURED -- aucun registre n'est choisi a sa place.
+    static final boolean ACR_PUBLISH_ENABLED = true
 
     // ---- Default governance-neutral gate (Jenkins never enforces by default) ----
     static final boolean DEFAULT_JENKINS_HARD_GATE = false
@@ -67,6 +78,11 @@ class PlatformConfig implements Serializable {
     static final int TIMEOUT_OWASP_MINUTES = 40
     static final int TIMEOUT_ZAP_MINUTES = 40
     static final int TIMEOUT_POST_REPORT_MINUTES = 2
+
+    // R59 — les constantes de fenetre/reprise de provenance ont ete supprimees
+    // avec l'ecrivain Jenkins. Il n'y a plus de delai a dimensionner : la
+    // plateforme enregistre la provenance quand l'identite de build est
+    // persistee, pas apres une attente devinee.
 
     static final String OWASP_DC_VERSION = '12.2.2'
     static final String OWASP_DC_DATA_DIR = '/var/jenkins_home/dependency-check-data-v12'
