@@ -199,11 +199,11 @@ def call(Closure body = null) {
 
                         stage('Build') {
                             // Hook additif : un projet peut fournir sa PROPRE étape Build
-                            // visible (closure `buildStep`) — utilisé par le banc de
+                            // visible (chaîne `buildCommand`) — utilisé par le banc de
                             // validation pour exposer un défaut corrigeable par WF4. Sans
                             // buildStep, comportement d'origine strictement inchangé.
-                            if (config.buildStep instanceof Closure) {
-                                buildRunner.runCustom(config.buildStep, skipTests, workingDirectory)
+                            if (config.buildCommand) {
+                                buildRunner.runCustom(config.buildCommand.toString(), skipTests, workingDirectory)
                             } else {
                                 buildRunner.run(buildType, skipTests, workingDirectory)
                             }

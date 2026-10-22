@@ -75,14 +75,17 @@ class BuildRunner implements Serializable {
      * son étape Build VISIBLE et corrigeable (banc de validation WF4) sans dupliquer
      * la plomberie plateforme. Additif : inutilisé si aucun buildStep n'est fourni.
      */
-    void runCustom(Closure buildStep, boolean skipTests, String workingDirectory) {
-        if (buildStep == null) {
-            steps.error('devSecOpsPipeline: buildStep override demande mais aucune closure fournie.')
+    void runCustom(String buildCommand, boolean skipTests, String workingDirectory) {
+        if (!buildCommand?.trim()) {
+            steps.error('devSecOpsPipeline: buildCommand override demande mais vide.')
         }
+        // La commande est une CHAINE (pas une closure) : evite le rejet du bac a
+        // sable Groovy (DefaultGroovyMethods.invokeMethod) qui se produit quand une
+        // closure definie dans le Jenkinsfile sandboxe est appelee depuis la lib.
         telemetry.buildStageStatus['build'] = 'FAILED'
         steps.dir(workingDirectory ?: '.') {
             steps.catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
-                buildStep.call()
+                steps.sh(buildCommand)
                 telemetry.buildStageStatus['build'] = 'SUCCESS'
             }
             if (skipTests) {
