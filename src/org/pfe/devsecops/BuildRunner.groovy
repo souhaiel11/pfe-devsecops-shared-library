@@ -68,6 +68,32 @@ class BuildRunner implements Serializable {
     }
 
     /**
+     * Variante PIPELINE_GENERIC : exécute une étape de build FOURNIE PAR LE PROJET
+     * (closure visible dans son Jenkinsfile) au lieu du `mvn clean package` standard.
+     * Même contrat de télémétrie que run() ; un échec réel de l'étape marque le build
+     * FAILURE (choix explicite du projet, pas UNSTABLE). Permet à un projet de garder
+     * son étape Build VISIBLE et corrigeable (banc de validation WF4) sans dupliquer
+     * la plomberie plateforme. Additif : inutilisé si aucun buildStep n'est fourni.
+     */
+    void runCustom(Closure buildStep, boolean skipTests, String workingDirectory) {
+        if (buildStep == null) {
+            steps.error('devSecOpsPipeline: buildStep override demande mais aucune closure fournie.')
+        }
+        telemetry.buildStageStatus['build'] = 'FAILED'
+        steps.dir(workingDirectory ?: '.') {
+            steps.catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                buildStep.call()
+                telemetry.buildStageStatus['build'] = 'SUCCESS'
+            }
+            if (skipTests) {
+                telemetry.tests = [status: 'SKIPPED', total: 0, failures: 0, skipped: 0, coverage: null]
+            } else {
+                processSurefireResults()
+            }
+        }
+    }
+
+    /**
      * R80 -- reads every Surefire XML report EXACTLY ONCE and derives BOTH
      * the aggregate suite totals and the per-testcase semantic-evidence
      * facts from that SAME parsed structure. Replaces the previous
